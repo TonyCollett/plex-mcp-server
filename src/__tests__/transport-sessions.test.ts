@@ -329,6 +329,31 @@ describe("MCP HTTP handler", () => {
     expect(res.status).toBe(404);
   });
 
+  // Hosted clients have been seen sending tool calls with no session ID after a
+  // server restart instead of re-initializing. Stateful mode alone answers that
+  // with 400 "Server not initialized" and the client gives up.
+  it("answers a sessionless non-initialize request statelessly instead of 400", async () => {
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: 7 }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("mcp-session-id")).toBeNull();
+    const json = await res.json();
+    expect(json).toMatchObject({ id: 7, result: { tools: [{ name: "ping" }] } });
+    // Stateless requests don't occupy a session slot.
+    expect(store.size).toBe(0);
+  });
+
+  it("still opens a tracked session for an initialize request", async () => {
+    const client = new Client({ name: "a", version: "1.0" }, { capabilities: {} });
+    await client.connect(new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`)));
+    expect(store.size).toBe(1);
+    await client.close();
+  });
+
   // THE bug PR #89 set out to fix: a single shared McpServer cannot back two
   // transports, so the second client used to get "400 already initialized".
   it("supports two concurrent clients, each with its own session", async () => {

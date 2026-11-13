@@ -14,6 +14,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 
 type TransportMode = "stdio" | "http";
 
@@ -222,6 +223,11 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
   res.end(JSON.stringify(payload));
 }
 
+/** True when a JSON-RPC body (single message or batch) carries an initialize request. */
+function containsInitialize(body: unknown): boolean {
+  return Array.isArray(body) ? body.some((m) => isInitializeRequest(m)) : isInitializeRequest(body);
+}
+
 function sendRpcError(res: ServerResponse, status: number, code: number, message: string): void {
   sendJson(res, status, { jsonrpc: "2.0", error: { code, message }, id: null });
 }
@@ -315,6 +321,28 @@ export function createMcpRequestHandler(options: McpHandlerOptions) {
         return;
       }
       await (transport as StreamableHTTPServerTransport).handleRequest(req, res, body);
+      return;
+    }
+
+    // ── Sessionless request ───────────────────────────────────────────────
+    // A request with no session ID that isn't an initialize can only be
+    // answered statelessly. Some hosted MCP clients send tool calls this way
+    // after the server restarts or their session expires, instead of
+    // re-initializing; stateful mode would reject them with a 400 ("Server not
+    // initialized") and the client gives up. Serve it with a throwaway Server
+    // and transport that are closed once the response is sent.
+    if (!containsInitialize(body)) {
+      const stateless = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+        enableJsonResponse: true,
+      });
+      const server = getServer();
+      res.on("close", () => {
+        void stateless.close().catch(() => {});
+        void server.close().catch(() => {});
+      });
+      await server.connect(stateless);
+      await stateless.handleRequest(req, res, body);
       return;
     }
 
