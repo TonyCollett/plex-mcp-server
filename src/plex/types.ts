@@ -6,6 +6,12 @@ export interface PlexConfig {
   baseUrl: string;
   token: string;
   clientIdentifier?: string;
+  /** Abort a Plex request after this many ms (default 30000). */
+  requestTimeoutMs?: number;
+  /** Log requests slower than this many ms to stderr (default 2000). */
+  slowRequestMs?: number;
+  /** Log every Plex request with its timing, not just slow or failed ones. */
+  logAllRequests?: boolean;
 }
 
 export interface MCPResponse {

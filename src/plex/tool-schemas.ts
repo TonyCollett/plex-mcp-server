@@ -145,13 +145,33 @@ const GET_EDITABLE_FIELDS_SCHEMA = {
 
 const GET_PLAYLIST_ITEMS_SCHEMA = {
   name: "get_playlist_items",
-  description: "Get items in a Plex playlist",
+  description:
+    "Get items in a Plex playlist. Tracks include album and artist names. " +
+    "Pass limit/offset to page through large playlists.",
   inputSchema: {
     type: "object" as const,
     properties: {
       playlistId: { type: "string", description: "Playlist rating key" },
+      limit: { type: "number", description: "Max items to return (optional; default: all)" },
+      offset: { type: "number", description: "Zero-based offset, used with limit (default: 0)" },
     },
     required: ["playlistId"],
+  },
+};
+
+const GET_CHILDREN_SCHEMA = {
+  name: "get_children",
+  description:
+    "List an item's direct children: an artist's albums, an album's tracks (all discs), " +
+    "a show's seasons or a season's episodes",
+  inputSchema: {
+    type: "object" as const,
+    properties: {
+      ratingKey: { type: "string", description: "Rating key of the artist, album, show or season" },
+      limit: { type: "number", description: "Max items to return (optional; default: all)" },
+      offset: { type: "number", description: "Zero-based offset (default: 0)" },
+    },
+    required: ["ratingKey"],
   },
 };
 
@@ -394,14 +414,21 @@ const CREATE_PLAYLIST_SCHEMA = {
 
 const ADD_TO_PLAYLIST_SCHEMA = {
   name: "add_to_playlist",
-  description: "Add a media item to a playlist (requires PLEX_ENABLE_MUTATIVE_OPS=true)",
+  description:
+    "Add one or more media items to a playlist in a single request (requires PLEX_ENABLE_MUTATIVE_OPS=true). " +
+    "Pass ratingKeys to add many items at once; items are appended in the order given.",
   inputSchema: {
     type: "object" as const,
     properties: {
       playlistId: { type: "string", description: "Playlist rating key" },
-      ratingKey: { type: "string", description: "Media rating key to add" },
+      ratingKey: { type: "string", description: "A single media rating key to add" },
+      ratingKeys: {
+        type: "array",
+        items: { type: "string" },
+        description: "Several media rating keys to add in one request (takes precedence over ratingKey)",
+      },
     },
-    required: ["playlistId", "ratingKey"],
+    required: ["playlistId"],
   },
 };
 
@@ -522,6 +549,7 @@ export const PLEX_CORE_TOOL_SCHEMAS = [
   GET_MEDIA_DETAILS_SCHEMA,
   GET_EDITABLE_FIELDS_SCHEMA,
   GET_PLAYLIST_ITEMS_SCHEMA,
+  GET_CHILDREN_SCHEMA,
   GET_PLAYLISTS_SCHEMA,
   GET_WATCHLIST_SCHEMA,
   GET_RECENTLY_WATCHED_SCHEMA,

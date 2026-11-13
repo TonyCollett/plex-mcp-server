@@ -28,6 +28,17 @@ import { createTraktToolRegistry } from "./trakt/tool-registry.js";
 import { ArrMCPFunctions } from "./arr/mcp-functions.js";
 import { createArrToolRegistry } from "./arr/tool-registry.js";
 
+function positiveIntEnv(name: string): number | undefined {
+  const value = parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/** One stderr line per tool call: name, outcome and duration. Off with MCP_LOG_TOOL_CALLS=false. */
+function logToolCall(name: string, outcome: "ok" | "error", started: number): void {
+  if (process.env.MCP_LOG_TOOL_CALLS === "false") return;
+  console.error(`[tool] ${name} ${outcome} ${Date.now() - started}ms`);
+}
+
 class UnifiedMCPServer {
   /**
    * Build a fully wired Server instance.
@@ -49,6 +60,9 @@ class UnifiedMCPServer {
     const plexClient = new PlexClient({
       baseUrl: process.env.PLEX_URL || DEFAULT_PLEX_URL,
       token: plexToken,
+      requestTimeoutMs: positiveIntEnv("PLEX_REQUEST_TIMEOUT_MS"),
+      slowRequestMs: positiveIntEnv("PLEX_SLOW_REQUEST_MS"),
+      logAllRequests: process.env.PLEX_LOG_REQUESTS === "true",
     });
 
     const plexTools = new PlexTools(plexClient);
@@ -67,12 +81,17 @@ class UnifiedMCPServer {
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
       const a = (args ?? {}) as Record<string, unknown>;
+      const started = Date.now();
 
       try {
-        if (plexRegistry.has(name)) return await plexRegistry.handle(name, a);
-        if (traktRegistry.has(name)) return await traktRegistry.handle(name, a);
-        return await arrRegistry.handle(name, a);
+        let result;
+        if (plexRegistry.has(name)) result = await plexRegistry.handle(name, a);
+        else if (traktRegistry.has(name)) result = await traktRegistry.handle(name, a);
+        else result = await arrRegistry.handle(name, a);
+        logToolCall(name, "ok", started);
+        return result;
       } catch (error) {
+        logToolCall(name, "error", started);
         if (error instanceof McpError) throw error;
         const msg = error instanceof Error ? error.message : String(error);
         throw new McpError(ErrorCode.InternalError, `Error executing ${name}: ${msg}`);

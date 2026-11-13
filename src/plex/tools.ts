@@ -81,6 +81,23 @@ function showContext(item: Record<string, unknown>) {
       seasonNumber: item.index,
     };
   }
+  if (item.type === "track") {
+    return {
+      albumTitle: item.parentTitle,
+      albumRatingKey: item.parentRatingKey ?? ratingKeyFromKey(item.parentKey),
+      artistTitle: item.grandparentTitle,
+      // Track-level artist when it differs from the album artist (features, compilations).
+      trackArtist: item.originalTitle && item.originalTitle !== item.grandparentTitle ? item.originalTitle : undefined,
+      discNumber: item.parentIndex,
+      trackNumber: item.index,
+    };
+  }
+  if (item.type === "album") {
+    return {
+      artistTitle: item.parentTitle,
+      artistRatingKey: item.parentRatingKey ?? ratingKeyFromKey(item.parentKey),
+    };
+  }
   return {};
 }
 
@@ -398,15 +415,61 @@ export class PlexTools {
     });
   }
 
-  async getPlaylistItems(playlistId: string): Promise<MCPResponse> {
+  /**
+   * List an item's direct children: an artist's albums, an album's tracks,
+   * a show's seasons or a season's episodes. One request, paged.
+   */
+  async getChildren(ratingKey: string, limit?: number, offset: number = 0): Promise<MCPResponse> {
+    validatePlexId(ratingKey, "ratingKey");
+    const safeOffset = Number.isFinite(offset) && offset >= 0 ? Math.floor(offset) : 0;
+    const params: Record<string, string | number> = { "X-Plex-Container-Start": safeOffset };
+    if (limit !== undefined && Number.isFinite(limit) && limit > 0) {
+      params["X-Plex-Container-Size"] = Math.floor(limit);
+    }
+
+    const data = await this.client.makeRequest(`/library/metadata/${ratingKey}/children`, params);
+    const mc = (data as { MediaContainer?: Record<string, unknown> }).MediaContainer || {};
+    const items = (mc.Metadata as Record<string, unknown>[] | undefined) || [];
+
+    return jsonResponse({
+      ratingKey,
+      // Plex's container titles: title2 is the item itself, title1 its parent (e.g. album, artist).
+      title: mc.title2 ?? mc.parentTitle,
+      parentTitle: mc.title1,
+      totalSize: (mc.totalSize as number | undefined) ?? (mc.size as number | undefined) ?? items.length,
+      offset: safeOffset,
+      items: items.map((item) => ({
+        ratingKey: item.ratingKey,
+        title: item.title,
+        type: item.type,
+        ...showContext(item),
+        index: item.type === "track" || item.type === "episode" ? undefined : item.index,
+        year: item.year,
+        duration: item.duration,
+        viewCount: item.viewCount,
+        userRating: item.userRating,
+      })),
+    });
+  }
+
+  async getPlaylistItems(playlistId: string, limit?: number, offset: number = 0): Promise<MCPResponse> {
     validatePlexId(playlistId, "playlistId");
 
-    const data = await this.client.makeRequest(`/playlists/${playlistId}/items`);
-    const container = data as { MediaContainer?: { Metadata?: Record<string, unknown>[] } };
+    const safeOffset = Number.isFinite(offset) && offset >= 0 ? Math.floor(offset) : 0;
+    const params: Record<string, string | number> = {};
+    if (limit !== undefined && Number.isFinite(limit) && limit > 0) {
+      params["X-Plex-Container-Start"] = safeOffset;
+      params["X-Plex-Container-Size"] = Math.floor(limit);
+    }
+
+    const data = await this.client.makeRequest(`/playlists/${playlistId}/items`, params);
+    const container = data as { MediaContainer?: { Metadata?: Record<string, unknown>[]; totalSize?: number } };
     const items = container.MediaContainer?.Metadata || [];
+    const paged = params["X-Plex-Container-Size"] !== undefined;
 
     return jsonResponse({
       playlistId,
+      ...(paged ? { offset: safeOffset, totalSize: container.MediaContainer?.totalSize } : {}),
       items: items.map((item) => ({
         playlistItemID: item.playlistItemID,
         ratingKey: item.ratingKey,
@@ -653,6 +716,8 @@ export class PlexTools {
     this.requireMutativeOpsEnabled("update_metadata");
     validatePlexId(input.ratingKey, "ratingKey");
 
+    // Plex field names, keyed to the values requested. `rating` is the user's
+    // star rating, which Plex sets through its rate endpoint, not a field edit.
     const params: Record<string, string | number> = {};
     if (input.title !== undefined) params.title = input.title;
     if (input.sortTitle !== undefined) params.titleSort = input.sortTitle;
@@ -660,9 +725,9 @@ export class PlexTools {
     if (input.summary !== undefined) params.summary = input.summary;
     if (input.year !== undefined) params.year = input.year;
     if (input.contentRating !== undefined) params.contentRating = input.contentRating;
-    if (input.rating !== undefined) params.rating = input.rating;
     if (input.tagline !== undefined) params.tagline = input.tagline;
     if (input.studio !== undefined) params.studio = input.studio;
+    const ratingRequested = input.rating !== undefined;
 
     const tagInputs = {
       genres: this.normalizeTagList(input.genres),
@@ -677,7 +742,7 @@ export class PlexTools {
       input.roles !== undefined ||
       input.directors !== undefined;
 
-    if (Object.keys(params).length === 0 && !hasTagUpdates) {
+    if (Object.keys(params).length === 0 && !hasTagUpdates && !ratingRequested) {
       throw new McpError(
         ErrorCode.InvalidRequest,
         "At least one metadata field must be provided"
@@ -686,13 +751,28 @@ export class PlexTools {
 
     const warnings: string[] = [];
     let anySuccess = false;
+    let verifiedFields: string[] | undefined;
 
     if (Object.keys(params).length > 0) {
       try {
-        await this.client.makeRequest(`/library/metadata/${input.ratingKey}`, params, "PUT");
-        anySuccess = true;
+        verifiedFields = await this.editFieldsVerified(input.ratingKey, params, warnings);
+        if (verifiedFields.length > 0) anySuccess = true;
       } catch (error) {
         warnings.push(`Basic metadata update failed: ${this.getErrorMessage(error)}`);
+      }
+    }
+
+    if (ratingRequested) {
+      const rating = Number(input.rating);
+      if (!Number.isFinite(rating) || rating < 0 || rating > 10) {
+        warnings.push("rating must be between 0 and 10; not applied");
+      } else {
+        try {
+          await this.client.rateMedia(input.ratingKey, rating);
+          anySuccess = true;
+        } catch (error) {
+          warnings.push(`Rating update failed: ${this.getErrorMessage(error)}`);
+        }
       }
     }
 
@@ -724,6 +804,7 @@ export class PlexTools {
       updated: anySuccess,
       ratingKey: input.ratingKey,
       fields: params,
+      verifiedFields,
       tagResults: tagResults.length > 0 ? tagResults : undefined,
       warnings: warnings.length > 0 ? warnings : undefined,
     });
@@ -917,42 +998,79 @@ export class PlexTools {
     });
   }
 
-  async addToPlaylist(playlistId: string, ratingKey: string): Promise<MCPResponse> {
+  /**
+   * Add one or more items to a playlist in a single request.
+   *
+   * Plex's endpoint is PUT /playlists/{id}/items with a library URI whose
+   * metadata path takes a comma-joined key list, so any number of items costs
+   * one round trip. Plex reports `leafCountAdded` in the response; only when it
+   * doesn't do we fall back to re-reading the playlist to confirm.
+   */
+  async addToPlaylist(playlistId: string, ratingKeys: string | string[]): Promise<MCPResponse> {
     this.requireMutativeOpsEnabled("add_to_playlist");
     validatePlexId(playlistId, "playlistId");
-    validatePlexId(ratingKey, "ratingKey");
+
+    const keys = (Array.isArray(ratingKeys) ? ratingKeys : [ratingKeys])
+      .map((k) => String(k ?? "").trim())
+      .filter((k) => k.length > 0);
+    if (keys.length === 0) {
+      throw new McpError(ErrorCode.InvalidRequest, "Provide ratingKey or a non-empty ratingKeys array");
+    }
+    keys.forEach((k) => validatePlexId(k, "ratingKey"));
 
     const machineIdentifier = await this.getMachineIdentifier();
-    const uri = `server://${machineIdentifier}/com.plexapp.plugins.library/library/metadata/${ratingKey}`;
-    const attempts = [
-      { method: "POST", endpoint: `/playlists/${playlistId}/items`, label: "POST /playlists/{id}/items" },
-      { method: "PUT", endpoint: `/playlists/${playlistId}/items`, label: "PUT /playlists/{id}/items" },
-    ];
+    const uri = `server://${machineIdentifier}/com.plexapp.plugins.library/library/metadata/${keys.join(",")}`;
+    const endpoint = `/playlists/${playlistId}/items`;
 
-    const errors: string[] = [];
-    for (const attempt of attempts) {
-      try {
-        await this.client.makeRequest(attempt.endpoint, { uri }, attempt.method);
-        const verification = await this.isItemInPlaylist(playlistId, ratingKey);
-        if (verification.found) {
-          return jsonResponse({
-            added: true,
-            playlistId,
-            ratingKey,
-            method: attempt.method,
-            endpoint: attempt.endpoint,
-          });
-        }
-        errors.push(`${attempt.label}: request succeeded but item was not found in playlist`);
-      } catch (error) {
-        errors.push(`${attempt.label}: ${this.getErrorMessage(error)}`);
-      }
+    let data: Record<string, unknown>;
+    try {
+      data = await this.client.makeRequest(endpoint, { uri }, "PUT");
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Unable to add ${keys.length} item(s) to playlist ${playlistId}: ${this.getErrorMessage(error)}`
+      );
     }
 
-    throw new McpError(
-      ErrorCode.InternalError,
-      `Unable to add item ${ratingKey} to playlist ${playlistId}. Attempts: ${errors.join(" | ")}`
-    );
+    const container = (data as { MediaContainer?: { leafCountAdded?: number | string } })?.MediaContainer;
+    const reported = container?.leafCountAdded !== undefined ? Number(container.leafCountAdded) : NaN;
+
+    let addedCount: number;
+    let missing: string[] = [];
+    if (Number.isFinite(reported)) {
+      addedCount = reported;
+    } else {
+      const present = await this.playlistRatingKeys(playlistId);
+      missing = keys.filter((k) => !present.has(k));
+      addedCount = keys.length - missing.length;
+    }
+
+    if (addedCount === 0) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Plex accepted the request but added none of the ${keys.length} item(s) to playlist ${playlistId}`
+      );
+    }
+
+    return jsonResponse({
+      added: true,
+      playlistId,
+      requested: keys.length,
+      addedCount,
+      ratingKeys: keys,
+      ...(missing.length > 0 ? { notFoundAfterAdd: missing } : {}),
+    });
+  }
+
+  /** Rating keys currently in a playlist (one paged read). */
+  private async playlistRatingKeys(playlistId: string): Promise<Set<string>> {
+    const data = await this.client.makeRequest(`/playlists/${playlistId}/items`, {
+      "X-Plex-Container-Start": 0,
+      "X-Plex-Container-Size": 5000,
+    });
+    const items = (data as { MediaContainer?: { Metadata?: Array<Record<string, unknown>> } })
+      .MediaContainer?.Metadata || [];
+    return new Set(items.map((item) => String(item.ratingKey)));
   }
 
   async removeFromPlaylist(playlistId: string, playlistItemId: string): Promise<MCPResponse> {
@@ -1561,6 +1679,44 @@ export class PlexTools {
       .filter((tag) => tag.length > 0);
   }
 
+  /**
+   * Edit plain fields the way Plex's own clients do — PUT /library/sections/{id}/all
+   * with the item's type id and `field.value` / `field.locked=1` — then re-read the
+   * item and report which fields actually changed. Plex answers a wrong or missing
+   * type with 200 and writes nothing, so the re-read is what tells success apart.
+   * Locking keeps a later refresh or rescan from overwriting the edit.
+   */
+  private async editFieldsVerified(
+    ratingKey: string,
+    fields: Record<string, string | number>,
+    warnings: string[]
+  ): Promise<string[]> {
+    const { item, libraryKey } = await this.getMediaContext(ratingKey);
+    validatePlexId(libraryKey, "libraryKey");
+
+    const body: Record<string, string | number> = {
+      id: ratingKey,
+      type: this.getTaggableTypeId(item.type as string),
+    };
+    for (const [field, value] of Object.entries(fields)) {
+      body[`${field}.value`] = value;
+      body[`${field}.locked`] = 1;
+    }
+    await this.client.makeRequest(`/library/sections/${libraryKey}/all`, body, "PUT");
+
+    const { item: after } = await this.getMediaContext(ratingKey);
+    const applied: string[] = [];
+    for (const [field, value] of Object.entries(fields)) {
+      const now = String(after[field] ?? "").trim();
+      if (now === String(value).trim()) {
+        applied.push(field);
+      } else {
+        warnings.push(`Plex did not save ${field}: it still reads "${now}"`);
+      }
+    }
+    return applied;
+  }
+
   private async replaceTagsSafely(
     ratingKey: string,
     tag: EditableTagType,
@@ -1781,23 +1937,6 @@ export class PlexTools {
     }
     this.machineIdentifier = machineIdentifier;
     return machineIdentifier;
-  }
-
-  private async isItemInPlaylist(playlistId: string, ratingKey: string): Promise<{ found: boolean }> {
-    validatePlexId(playlistId, "playlistId");
-    try {
-      const data = await this.client.makeRequest(`/playlists/${playlistId}/items`, {
-        "X-Plex-Container-Start": 0,
-        "X-Plex-Container-Size": 2000,
-      });
-      const container = data as { MediaContainer?: { Metadata?: Array<Record<string, unknown>> } };
-      const items = container.MediaContainer?.Metadata || [];
-      return {
-        found: items.some((item) => String(item.ratingKey) === String(ratingKey)),
-      };
-    } catch {
-      return { found: false };
-    }
   }
 
   private getPlaylistType(type: string): "video" | "audio" | "photo" {

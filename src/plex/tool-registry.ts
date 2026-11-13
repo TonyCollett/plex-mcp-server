@@ -105,7 +105,19 @@ export function createPlexToolRegistry(tools: PlexTools, options: ToolRegistryOp
   );
 
   registry.register("get_playlist_items", (args) =>
-    tools.getPlaylistItems(args.playlistId as string)
+    tools.getPlaylistItems(
+      args.playlistId as string,
+      args.limit as number | undefined,
+      (args.offset as number) || 0
+    )
+  );
+
+  registry.register("get_children", (args) =>
+    tools.getChildren(
+      args.ratingKey as string,
+      args.limit as number | undefined,
+      (args.offset as number) || 0
+    )
   );
 
   registry.register("get_playlists", () => tools.getPlaylists());
@@ -241,7 +253,12 @@ export function createPlexToolRegistry(tools: PlexTools, options: ToolRegistryOp
   ));
 
   registry.register("add_to_playlist", guardMutativeOp((args) =>
-    tools.addToPlaylist(args.playlistId as string, args.ratingKey as string)
+    tools.addToPlaylist(
+      args.playlistId as string,
+      Array.isArray(args.ratingKeys) && args.ratingKeys.length > 0
+        ? (args.ratingKeys as string[])
+        : (args.ratingKey as string)
+    )
   ));
 
   registry.register("remove_from_playlist", guardMutativeOp((args) =>

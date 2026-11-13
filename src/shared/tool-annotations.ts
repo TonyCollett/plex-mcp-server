@@ -47,6 +47,7 @@ const READ_ONLY_TOOLS = new Set<string>([
   "get_media_details",
   "get_editable_fields",
   "get_playlist_items",
+  "get_children",
   "get_playlists",
   "get_watchlist",
   "get_recently_watched",

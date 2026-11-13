@@ -27,7 +27,7 @@ This MCP server transforms your Plex Media Server into an AI-queryable database.
 
 ## Features
 
-**54 tools** out of the box (66 with write operations enabled):
+**55 tools** out of the box (67 with write operations enabled):
 
 - **Plex Library Management** — Browse libraries, search media, get detailed metadata, list playlists and watchlist
 - **Tautulli-Style Analytics** — Viewing statistics, user activity, popular content, watch history
@@ -171,6 +171,22 @@ than it is today. The guarantee is over characters, not tokens.
 Leave the variable unset — the default — and responses are byte-for-byte the
 JSON they have always been.
 
+### Timeouts and Logging (optional)
+
+Every Plex request gives up after `PLEX_REQUEST_TIMEOUT_MS` (default `30000`),
+so a stalled Plex server fails a tool call instead of hanging it. The server
+writes one line to stderr per tool call (`[tool] add_to_playlist ok 412ms`) and
+one per Plex request that fails or takes longer than `PLEX_SLOW_REQUEST_MS`
+(default `2000`). Logged lines carry the method and path only, never query
+parameters.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PLEX_REQUEST_TIMEOUT_MS` | `30000` | Abort a Plex request after this many ms |
+| `PLEX_SLOW_REQUEST_MS` | `2000` | Log Plex requests slower than this |
+| `PLEX_LOG_REQUESTS` | unset | `true` logs every Plex request with its timing |
+| `MCP_LOG_TOOL_CALLS` | on | `false` turns off the per-tool-call line |
+
 <details>
 <summary><strong>Migrating from v1.0.x?</strong></summary>
 
@@ -224,9 +240,9 @@ Once configured, you can ask your AI assistant:
 
 ## Available Functions
 
-54 tools out of the box (66 with write operations enabled).
+55 tools out of the box (67 with write operations enabled).
 
-### Plex Tools (20 tools)
+### Plex Tools (21 tools)
 
 | Function | Description |
 |----------|-------------|
@@ -239,7 +255,8 @@ Once configured, you can ask your AI assistant:
 | `get_media_details` | Detailed media info |
 | `get_editable_fields` | Show editable fields, available tags and locked fields for an item |
 | `get_playlists` | List all Plex playlists |
-| `get_playlist_items` | List items in a playlist |
+| `get_playlist_items` | List items in a playlist; optional `limit`/`offset` paging |
+| `get_children` | List an item's children: an artist's albums, an album's tracks, a show's seasons or a season's episodes |
 | `get_watchlist` | Get the current account Watchlist from Plex Discover |
 | `get_recently_watched` | Recently watched content |
 | `get_watch_history` | Detailed watch sessions |
@@ -257,10 +274,10 @@ Set `PLEX_ENABLE_MUTATIVE_OPS=true` to enable these tools. They allow your AI as
 
 | Function | Description |
 |----------|-------------|
-| `update_metadata` | Update metadata fields and editable tags for a media item. A tag field is locked against refreshes while it holds tags; passing an empty list clears it and unlocks it |
+| `update_metadata` | Update metadata fields and editable tags for a media item. Edited fields are locked against refreshes and re-read afterwards; `verifiedFields` lists the ones Plex actually saved. A tag field is locked against refreshes while it holds tags; passing an empty list clears it and unlocks it |
 | `update_metadata_from_json` | Apply a metadata JSON payload using best-effort field mapping |
 | `create_playlist` | Create a new smart or static playlist |
-| `add_to_playlist` | Add a media item to a playlist |
+| `add_to_playlist` | Add one item (`ratingKey`) or many (`ratingKeys`) to a playlist in a single request |
 | `remove_from_playlist` | Remove an item from a playlist |
 | `clear_playlist` | Preview and optionally clear all items from a playlist (`confirm=true`) |
 | `delete_playlist` | Delete a playlist without deleting the underlying media |

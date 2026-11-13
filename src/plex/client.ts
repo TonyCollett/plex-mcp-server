@@ -13,6 +13,9 @@ import { validatePlexId } from "../shared/utils.js";
 
 const PLEX_DISCOVER_BASE_URL = "https://discover.provider.plex.tv";
 
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+export const DEFAULT_SLOW_REQUEST_MS = 2_000;
+
 export class PlexClient implements PlexAPIClient {
   constructor(private config: PlexConfig) {
     // Strip trailing slashes to prevent double-slash in URLs
@@ -20,6 +23,8 @@ export class PlexClient implements PlexAPIClient {
       ...config,
       baseUrl: config.baseUrl.replace(/\/+$/, ""),
       clientIdentifier: config.clientIdentifier || "plex-mcp-server",
+      requestTimeoutMs: config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+      slowRequestMs: config.slowRequestMs ?? DEFAULT_SLOW_REQUEST_MS,
     };
   }
 
@@ -32,10 +37,37 @@ export class PlexClient implements PlexAPIClient {
         Accept: "application/json",
       },
       params,
+      timeout: this.config.requestTimeoutMs,
     };
 
-    const response = await axios(url, axiosConfig);
-    return response.data;
+    return this.timed(method, endpoint, async () => (await axios(url, axiosConfig)).data);
+  }
+
+  /**
+   * Run a request and log it to stderr when it fails, is slow, or when
+   * all-request logging is on. Logs the method and path only — never params,
+   * which can carry user data.
+   */
+  private async timed<T>(method: string, endpoint: string, run: () => Promise<T>): Promise<T> {
+    const started = Date.now();
+    try {
+      const result = await run();
+      const ms = Date.now() - started;
+      if (this.config.logAllRequests || ms >= (this.config.slowRequestMs ?? DEFAULT_SLOW_REQUEST_MS)) {
+        console.error(`[plex] ${method} ${endpoint} ${ms}ms`);
+      }
+      return result;
+    } catch (error) {
+      const ms = Date.now() - started;
+      const err = error as { code?: string; response?: { status?: number }; message?: string };
+      const reason = err.code === "ECONNABORTED"
+        ? `timed out after ${this.config.requestTimeoutMs}ms`
+        : err.response?.status
+          ? `HTTP ${err.response.status}`
+          : err.code || err.message || "error";
+      console.error(`[plex] ${method} ${endpoint} FAILED ${reason} (${ms}ms)`);
+      throw error;
+    }
   }
 
   async makeDiscoverRequest(
@@ -43,17 +75,20 @@ export class PlexClient implements PlexAPIClient {
     params: Record<string, string | number> = {},
     method: string = "GET"
   ): Promise<Record<string, unknown>> {
-    const response = await axios(`${PLEX_DISCOVER_BASE_URL}${endpoint}`, {
-      method,
-      headers: {
-        "X-Plex-Token": this.config.token,
-        "X-Plex-Client-Identifier": this.config.clientIdentifier,
-        "X-Plex-Product": "plex-mcp-server",
-        Accept: "application/json",
-      },
-      params,
+    return this.timed(method, `discover:${endpoint}`, async () => {
+      const response = await axios(`${PLEX_DISCOVER_BASE_URL}${endpoint}`, {
+        method,
+        headers: {
+          "X-Plex-Token": this.config.token,
+          "X-Plex-Client-Identifier": this.config.clientIdentifier,
+          "X-Plex-Product": "plex-mcp-server",
+          Accept: "application/json",
+        },
+        params,
+        timeout: this.config.requestTimeoutMs,
+      });
+      return response.data;
     });
-    return response.data;
   }
 
   getPlexTypeId(type: string): number {
