@@ -280,11 +280,17 @@ export function resolveAllowedHosts(bindHost: string, configured?: string): stri
 
 /** Constant-time check of an `Authorization: Bearer <token>` header. */
 export function bearerTokenMatches(header: string | undefined, expected: string): boolean {
-  const match = /^Bearer\s+(.+)$/i.exec(header ?? "");
-  if (!match) return false;
+  // Plain string parsing rather than a regex: the header is attacker-controlled,
+  // and a pattern like /^Bearer\s+(.+)$/ backtracks polynomially on long runs
+  // of whitespace.
+  const value = (header ?? "").trim();
+  const space = value.search(/[ \t]/);
+  if (space <= 0 || value.slice(0, space).toLowerCase() !== "bearer") return false;
+  const token = value.slice(space + 1).trim();
+  if (!token) return false;
   // Hash both sides so the comparison is fixed-length and leaks nothing about
   // the token's length.
-  const a = createHash("sha256").update(match[1].trim()).digest();
+  const a = createHash("sha256").update(token).digest();
   const b = createHash("sha256").update(expected).digest();
   return timingSafeEqual(a, b);
 }
