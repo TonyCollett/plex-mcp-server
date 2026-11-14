@@ -185,8 +185,9 @@ Once authenticated, you have access to these Trakt functions:
 | `TRAKT_CLIENT_ID` | OAuth application client ID | Yes | - |
 | `TRAKT_CLIENT_SECRET` | OAuth application secret | Yes | - |
 | `TRAKT_REDIRECT_URI` | OAuth redirect URI | No | `urn:ietf:wg:oauth:2.0:oob` |
-| `TRAKT_ACCESS_TOKEN` | User access token (auto-set) | No | - |
-| `TRAKT_REFRESH_TOKEN` | User refresh token (auto-set) | No | - |
+| `TRAKT_ACCESS_TOKEN` | User access token (copy from the server log after `trakt_complete_auth`) | No | - |
+| `TRAKT_REFRESH_TOKEN` | User refresh token (copy from the server log after `trakt_complete_auth`) | No | - |
+| `TRAKT_TOKEN_FILE` | File that tokens are saved to after authentication and every refresh, and read back on start. Takes precedence over the two variables above. Recommended. | No | - |
 | `TRAKT_BASE_URL` | Custom API base URL | No | `https://api-v2launch.trakt.tv` |
 
 ### Sync Options

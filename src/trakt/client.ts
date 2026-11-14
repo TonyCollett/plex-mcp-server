@@ -29,6 +29,9 @@ import {
 } from './constants.js';
 import { sleep } from '../shared/utils.js';
 
+/** Retries of one request after HTTP 429 before the error is surfaced. */
+const MAX_RATE_LIMIT_RETRIES = 3;
+
 export interface TraktSearchResult {
   type: string;
   score: number;
@@ -41,6 +44,9 @@ export class TraktClient {
   private http: AxiosInstance;
   private rateLimitDelay: number = TRAKT_INITIAL_RATE_LIMIT_DELAY;
   private lastRequestTime: number = 0;
+  /** The refresh in progress, so concurrent 401s share one refresh: Trakt
+   *  refresh tokens are single-use, and a second refresh with the same one fails. */
+  private refreshing?: Promise<TraktTokens>;
 
   constructor(config: TraktConfig) {
     this.config = config;
@@ -82,7 +88,10 @@ export class TraktClient {
     this.http.interceptors.response.use(
       (response) => response,
       async (error: AxiosError) => {
-        if (error.response?.status === 429) {
+        const retryConfig = error.config as (typeof error.config & { _retries429?: number; _retried401?: boolean }) | undefined;
+
+        if (error.response?.status === 429 && retryConfig && (retryConfig._retries429 ?? 0) < MAX_RATE_LIMIT_RETRIES) {
+          retryConfig._retries429 = (retryConfig._retries429 ?? 0) + 1;
           // Rate limited - increase delay and retry
           const retryAfter = parseInt(error.response.headers['retry-after'] || String(TRAKT_DEFAULT_RETRY_AFTER));
           this.rateLimitDelay = Math.max(this.rateLimitDelay * TRAKT_RATE_LIMIT_BACKOFF_MULTIPLIER, retryAfter * 1000);
@@ -90,20 +99,25 @@ export class TraktClient {
           console.warn(`Trakt rate limit hit. Waiting ${retryAfter}s before retry. New delay: ${this.rateLimitDelay}ms`);
 
           await sleep(retryAfter * 1000);
-          return this.http.request(error.config!);
+          return this.http.request(retryConfig);
         }
 
-        if (error.response?.status === 401) {
-          // Unauthorized - try to refresh token
+        // Retry once after a refresh. Without the flag, a token that refreshes
+        // fine but is still refused would loop forever. The token endpoint is
+        // excluded so a failed refresh can't trigger another refresh.
+        if (
+          error.response?.status === 401 &&
+          retryConfig &&
+          !retryConfig._retried401 &&
+          !String(retryConfig.url ?? '').includes('/oauth/token')
+        ) {
           if (this.config.refreshToken) {
             try {
               await this.refreshAccessToken();
-              // Retry the original request with new token
-              if (error.config) {
-                error.config.headers = error.config.headers || {};
-                error.config.headers.Authorization = `Bearer ${this.config.accessToken}`;
-                return this.http.request(error.config);
-              }
+              retryConfig._retried401 = true;
+              retryConfig.headers = retryConfig.headers || {};
+              retryConfig.headers.Authorization = `Bearer ${this.config.accessToken}`;
+              return this.http.request(retryConfig);
             } catch (refreshError) {
               throw new Error('Token refresh failed. Re-authentication required.');
             }
@@ -154,6 +168,7 @@ export class TraktClient {
       // Store tokens in config
       this.config.accessToken = tokens.access_token;
       this.config.refreshToken = tokens.refresh_token;
+      this.config.onTokensUpdated?.(tokens);
 
       return tokens;
     } catch (error) {
@@ -169,7 +184,15 @@ export class TraktClient {
     if (!this.config.refreshToken) {
       throw new Error('No refresh token available');
     }
+    if (!this.refreshing) {
+      this.refreshing = this.doRefresh().finally(() => {
+        this.refreshing = undefined;
+      });
+    }
+    return this.refreshing;
+  }
 
+  private async doRefresh(): Promise<TraktTokens> {
     try {
       const response = await this.http.post<TraktTokens>('/oauth/token', {
         refresh_token: this.config.refreshToken,
@@ -185,6 +208,7 @@ export class TraktClient {
       // Update stored tokens
       this.config.accessToken = tokens.access_token;
       this.config.refreshToken = tokens.refresh_token;
+      this.config.onTokensUpdated?.(tokens);
 
       return tokens;
     } catch (error) {
@@ -352,8 +376,8 @@ export class TraktClient {
   /**
    * Get current configuration (excluding sensitive data)
    */
-  getConfig(): Omit<TraktConfig, 'clientSecret' | 'accessToken' | 'refreshToken'> {
-    const { clientSecret, accessToken, refreshToken, ...safeConfig } = this.config;
+  getConfig(): Omit<TraktConfig, 'clientSecret' | 'accessToken' | 'refreshToken' | 'onTokensUpdated'> {
+    const { clientSecret, accessToken, refreshToken, onTokensUpdated, ...safeConfig } = this.config;
     return safeConfig;
   }
 }

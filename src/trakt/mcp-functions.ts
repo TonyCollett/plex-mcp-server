@@ -14,6 +14,7 @@ import {
 import { DEFAULT_TRAKT_API_URL, DEFAULT_BATCH_SIZE, ACHIEVEMENT_THRESHOLDS, TRAKT_PREVIEW_LIMIT } from './constants.js';
 import { SUMMARY_PREVIEW_LENGTH } from '../plex/constants.js';
 import { truncate, sanitizeSearchQuery } from '../shared/utils.js';
+import { loadTraktTokens, saveTraktTokens, traktTokenFilePath } from './token-store.js';
 
 export class TraktMCPFunctions {
   private traktClient!: TraktClient;
@@ -50,13 +51,28 @@ export class TraktMCPFunctions {
   private initializeTraktClient(): void {
     if (this.isInitialized) return;
 
+    // A token file, when configured, is newer than the environment: refresh
+    // tokens are single-use, so the env copy goes stale after one refresh.
+    const tokenFile = traktTokenFilePath();
+    const stored = tokenFile ? loadTraktTokens(tokenFile) : undefined;
+
     const config: TraktConfig = {
       baseUrl: process.env.TRAKT_BASE_URL || DEFAULT_TRAKT_API_URL,
       clientId: process.env.TRAKT_CLIENT_ID || '',
       clientSecret: process.env.TRAKT_CLIENT_SECRET || '',
       redirectUri: process.env.TRAKT_REDIRECT_URI || 'urn:ietf:wg:oauth:2.0:oob',
-      accessToken: process.env.TRAKT_ACCESS_TOKEN,
-      refreshToken: process.env.TRAKT_REFRESH_TOKEN
+      accessToken: stored?.accessToken ?? process.env.TRAKT_ACCESS_TOKEN,
+      refreshToken: stored?.refreshToken ?? process.env.TRAKT_REFRESH_TOKEN,
+      onTokensUpdated: tokenFile
+        ? (tokens) => {
+            saveTraktTokens(tokenFile, {
+              accessToken: tokens.access_token,
+              refreshToken: tokens.refresh_token,
+              createdAt: tokens.created_at,
+              expiresIn: tokens.expires_in,
+            });
+          }
+        : undefined,
     };
 
     if (!config.clientId || !config.clientSecret) {
@@ -113,26 +129,37 @@ export class TraktMCPFunctions {
       const tokens = await this.traktClient.exchangeCodeForToken(code);
       const user = await this.traktClient.getCurrentUser();
 
+      const tokenFile = traktTokenFilePath();
+      const userInfo = { username: user.username, name: user.name, vip: user.vip };
+
+      // Tokens are kept out of the tool result: it lands in the model's
+      // context and the client's transcript. They go to the token file when
+      // one is configured, otherwise to the server log for the operator.
+      if (tokenFile) {
+        return {
+          success: true,
+          user: userInfo,
+          tokenStorage: 'file',
+          message: `Authentication successful. Tokens were saved to ${tokenFile} and will be reused (and kept up to date) across restarts.`,
+          expiresIn: tokens.expires_in,
+        };
+      }
+
+      console.error(
+        '[trakt] Authentication succeeded. To persist it across restarts, add these to your MCP server environment:\n' +
+        `TRAKT_ACCESS_TOKEN=${tokens.access_token}\nTRAKT_REFRESH_TOKEN=${tokens.refresh_token}\n` +
+        '[trakt] Or set TRAKT_TOKEN_FILE so tokens are saved, and refreshed, automatically.'
+      );
       return {
         success: true,
-        user: {
-          username: user.username,
-          name: user.name,
-          vip: user.vip
-        },
-        tokens: {
-          access_token: tokens.access_token,
-          refresh_token: tokens.refresh_token,
-          expires_in: tokens.expires_in,
-          scope: tokens.scope,
-          created_at: tokens.created_at
-        },
-        message: 'Authentication successful! Add these to your environment config to persist across restarts:',
-        env_config: `TRAKT_ACCESS_TOKEN=${tokens.access_token}\nTRAKT_REFRESH_TOKEN=${tokens.refresh_token}`,
+        user: userInfo,
+        tokenStorage: 'memory',
+        message: 'Authentication successful. The tokens are active for this server process but are not saved. They were written to the server log (stderr), not to this chat.',
+        expiresIn: tokens.expires_in,
         nextSteps: [
-          'Add the above TRAKT_ACCESS_TOKEN and TRAKT_REFRESH_TOKEN to your MCP client env config or .env file',
+          'Recommended: set TRAKT_TOKEN_FILE to a writable path and authenticate again, so tokens persist and refresh automatically',
+          'Or copy TRAKT_ACCESS_TOKEN and TRAKT_REFRESH_TOKEN from the server log into your MCP server environment',
           'Use trakt_get_auth_status to verify authentication',
-          'Start syncing with trakt_sync_to_trakt'
         ]
       };
     } catch (error) {

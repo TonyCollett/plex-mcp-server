@@ -16,6 +16,7 @@ import {
   createPlexToolRegistry,
   DEFAULT_PLEX_URL,
 } from "./plex/index.js";
+import type { ToolRegistry } from "./plex/tool-registry.js";
 import { startServer } from "./shared/transport.js";
 import { SERVER_VERSION } from "./shared/version.js";
 import { listedToolSchemas } from "./shared/tool-list.js";
@@ -39,71 +40,90 @@ function logToolCall(name: string, outcome: "ok" | "error", started: number): vo
   console.error(`[tool] ${name} ${outcome} ${Date.now() - started}ms`);
 }
 
-class UnifiedMCPServer {
-  /**
-   * Build a fully wired Server instance.
-   *
-   * A factory rather than a constructor because HTTP transport needs one
-   * Server per session — a single instance cannot back concurrent clients.
-   */
-  static createServer(): Server {
-    const server = new Server(
-      { name: "plex-mcp-server", version: SERVER_VERSION },
-      { capabilities: { tools: {} } }
-    );
+type ToolServices = {
+  plexRegistry: ToolRegistry;
+  traktRegistry: ToolRegistry;
+  arrRegistry: ToolRegistry;
+};
 
-    const plexToken = process.env.PLEX_TOKEN;
-    if (!plexToken) {
-      throw new Error("PLEX_TOKEN environment variable is required");
-    }
+let sharedServices: ToolServices | undefined;
 
-    const plexClient = new PlexClient({
-      baseUrl: process.env.PLEX_URL || DEFAULT_PLEX_URL,
-      token: plexToken,
-      requestTimeoutMs: positiveIntEnv("PLEX_REQUEST_TIMEOUT_MS"),
-      slowRequestMs: positiveIntEnv("PLEX_SLOW_REQUEST_MS"),
-      logAllRequests: process.env.PLEX_LOG_REQUESTS === "true",
-    });
+/**
+ * Clients and tool registries, built once per process and shared by every
+ * session. They hold caches and credentials, not per-connection state, and
+ * sharing them matters for Trakt: its refresh tokens are single-use, so two
+ * sessions each refreshing from their own copy would lock one of them out.
+ */
+function getServices(): ToolServices {
+  if (sharedServices) return sharedServices;
 
-    const plexTools = new PlexTools(plexClient);
-    const traktFunctions = new TraktMCPFunctions(plexClient);
-    const plexRegistry = createPlexToolRegistry(plexTools, {
-      traktFunctions,
-    });
-    const traktRegistry = createTraktToolRegistry(traktFunctions);
-    const arrFunctions = new ArrMCPFunctions();
-    const arrRegistry = createArrToolRegistry(arrFunctions);
-
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: listedToolSchemas(),
-    }));
-
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: args } = request.params;
-      const a = (args ?? {}) as Record<string, unknown>;
-      const started = Date.now();
-
-      try {
-        let result;
-        if (plexRegistry.has(name)) result = await plexRegistry.handle(name, a);
-        else if (traktRegistry.has(name)) result = await traktRegistry.handle(name, a);
-        else result = await arrRegistry.handle(name, a);
-        logToolCall(name, "ok", started);
-        return result;
-      } catch (error) {
-        logToolCall(name, "error", started);
-        if (error instanceof McpError) throw error;
-        const msg = error instanceof Error ? error.message : String(error);
-        throw new McpError(ErrorCode.InternalError, `Error executing ${name}: ${msg}`);
-      }
-    });
-
-    return server;
+  const plexToken = process.env.PLEX_TOKEN;
+  if (!plexToken) {
+    throw new Error("PLEX_TOKEN environment variable is required");
   }
+
+  const plexClient = new PlexClient({
+    baseUrl: process.env.PLEX_URL || DEFAULT_PLEX_URL,
+    token: plexToken,
+    requestTimeoutMs: positiveIntEnv("PLEX_REQUEST_TIMEOUT_MS"),
+    slowRequestMs: positiveIntEnv("PLEX_SLOW_REQUEST_MS"),
+    logAllRequests: process.env.PLEX_LOG_REQUESTS === "true",
+  });
+
+  const plexTools = new PlexTools(plexClient);
+  const traktFunctions = new TraktMCPFunctions(plexClient);
+
+  sharedServices = {
+    plexRegistry: createPlexToolRegistry(plexTools, { traktFunctions }),
+    traktRegistry: createTraktToolRegistry(traktFunctions),
+    arrRegistry: createArrToolRegistry(new ArrMCPFunctions()),
+  };
+  return sharedServices;
+}
+
+/**
+ * Build a Server instance wired to the shared services.
+ *
+ * A factory because HTTP transport needs one Server per session — a single
+ * instance cannot back concurrent clients.
+ */
+function createServer(): Server {
+  const { plexRegistry, traktRegistry, arrRegistry } = getServices();
+
+  const server = new Server(
+    { name: "plex-mcp-server", version: SERVER_VERSION },
+    { capabilities: { tools: {} } }
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: listedToolSchemas(),
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    const a = (args ?? {}) as Record<string, unknown>;
+    const started = Date.now();
+
+    try {
+      let result;
+      if (plexRegistry.has(name)) result = await plexRegistry.handle(name, a);
+      else if (traktRegistry.has(name)) result = await traktRegistry.handle(name, a);
+      else result = await arrRegistry.handle(name, a);
+      logToolCall(name, "ok", started);
+      return result;
+    } catch (error) {
+      logToolCall(name, "error", started);
+      if (error instanceof McpError) throw error;
+      const msg = error instanceof Error ? error.message : String(error);
+      throw new McpError(ErrorCode.InternalError, `Error executing ${name}: ${msg}`);
+    }
+  });
+
+  return server;
 }
 
 export async function main() {
-  await startServer(() => UnifiedMCPServer.createServer(), "Plex MCP server (unified)");
+  await startServer(createServer, "Plex MCP server (unified)");
 }
 
 main().catch((error) => {

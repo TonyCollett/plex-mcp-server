@@ -38,6 +38,9 @@ export class PlexClient implements PlexAPIClient {
       },
       params,
       timeout: this.config.requestTimeoutMs,
+      // A redirect would carry X-Plex-Token to wherever it points: axios
+      // strips Authorization on a cross-host redirect, but not custom headers.
+      maxRedirects: 0,
     };
 
     return this.timed(method, endpoint, async () => (await axios(url, axiosConfig)).data);
@@ -121,6 +124,7 @@ export class PlexClient implements PlexAPIClient {
   }
 
   async getLibraryMoviesWithMeta(libraryKey: string, userId?: string): Promise<LibraryMovieRecord[]> {
+    validatePlexId(libraryKey, "libraryKey");
     const allMovies: LibraryMovieRecord[] = [];
     let offset = 0;
     const pageSize = PLEX_CONTAINER_SIZE;

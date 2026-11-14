@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { PLEX_TOOL_SCHEMAS, PLEX_MUTATIVE_TOOL_SCHEMAS } from "../plex/tool-schemas.js";
 import { TRAKT_TOOL_SCHEMAS } from "../trakt/tool-schemas.js";
 import { ARR_TOOL_SCHEMAS } from "../arr/tool-schemas.js";
+import { ARR_WRITE_TOOLS, TRAKT_WRITE_TOOLS } from "../shared/write-tools.js";
 
 /**
  * The README's tool counts have gone stale twice — once when a tool was added
@@ -14,8 +15,10 @@ describe("README tool counts stay in sync with the schemas", () => {
   const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8");
 
   const plexCount = PLEX_TOOL_SCHEMAS.length;
-  const baseCount = plexCount + TRAKT_TOOL_SCHEMAS.length + ARR_TOOL_SCHEMAS.length;
-  const totalCount = baseCount + PLEX_MUTATIVE_TOOL_SCHEMAS.length;
+  const nonPlexWriteCount = ARR_WRITE_TOOLS.length + TRAKT_WRITE_TOOLS.length;
+  const baseCount =
+    plexCount + TRAKT_TOOL_SCHEMAS.length + ARR_TOOL_SCHEMAS.length - nonPlexWriteCount;
+  const totalCount = baseCount + nonPlexWriteCount + PLEX_MUTATIVE_TOOL_SCHEMAS.length;
 
   it("states the Plex tool count correctly", () => {
     expect(readme).toContain(`### Plex Tools (${plexCount} tools)`);

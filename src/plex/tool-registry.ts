@@ -18,8 +18,12 @@ type ToolRegistryOptions = {
   traktFunctions?: TraktStatsProvider;
 };
 
-// Helper: wrap a handler to check mutative ops are enabled at runtime
-function guardMutativeOp(handler: ToolHandler): ToolHandler {
+/** Largest page any tool will ask a backend for. A model can send any number;
+ *  without a ceiling one call can pull a whole library into memory at once. */
+export const MAX_TOOL_PAGE_SIZE = 10_000;
+
+/** Wrap a handler so it refuses to run unless write operations are enabled. */
+export function guardMutativeOp(handler: ToolHandler): ToolHandler {
   return async (args: Record<string, unknown>) => {
     if (!isMutativeOpsEnabled()) {
       throw new McpError(
@@ -29,6 +33,18 @@ function guardMutativeOp(handler: ToolHandler): ToolHandler {
     }
     return handler(args);
   };
+}
+
+function clampPageSizes(args: Record<string, unknown>): Record<string, unknown> {
+  let out = args;
+  for (const key of ["limit", "pageSize"]) {
+    const value = args[key];
+    if (typeof value === "number" && value > MAX_TOOL_PAGE_SIZE) {
+      if (out === args) out = { ...args };
+      out[key] = MAX_TOOL_PAGE_SIZE;
+    }
+  }
+  return out;
 }
 
 export class ToolRegistry {
@@ -47,7 +63,7 @@ export class ToolRegistry {
     if (!handler) {
       throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
     }
-    return handler(args);
+    return handler(clampPageSizes(args));
   }
 }
 
