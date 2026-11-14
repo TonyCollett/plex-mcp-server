@@ -176,6 +176,19 @@ describe("transport helpers", () => {
     expect(bearerTokenMatches("Bearer abcd", "abc")).toBe(false);
     expect(bearerTokenMatches("Basic abc", "abc")).toBe(false);
     expect(bearerTokenMatches(undefined, "abc")).toBe(false);
+    expect(bearerTokenMatches("Bearer", "abc")).toBe(false);
+    expect(bearerTokenMatches("Bearer    ", "abc")).toBe(false);
+    expect(bearerTokenMatches("Bearer   abc  ", "abc")).toBe(true);
+    expect(bearerTokenMatches("Bearer\tabc", "abc")).toBe(true);
+  });
+
+  // Regression for CodeQL js/polynomial-redos: the old /^Bearer\s+(.+)$/i
+  // backtracked polynomially on long runs of whitespace.
+  it("handles a pathological Authorization header quickly", () => {
+    const header = "bearer " + " ".repeat(200_000) + "!";
+    const started = Date.now();
+    expect(bearerTokenMatches(header, "abc")).toBe(false);
+    expect(Date.now() - started).toBeLessThan(100);
   });
 });
 
