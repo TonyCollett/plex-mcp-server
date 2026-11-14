@@ -4,7 +4,7 @@ import { PLEX_MUTATIVE_TOOL_SCHEMAS } from "../plex/tool-schemas.js";
 import { PLEX_MUTATIVE_OPS_ENV_VAR } from "../plex/constants.js";
 import { ARR_WRITE_TOOLS, TRAKT_WRITE_TOOLS } from "../shared/write-tools.js";
 
-// README and package.json promise 43 tools out of the box and 67 with write
+// README and package.json promise 41 tools out of the box and 67 with write
 // operations enabled. tools/list is what clients see, so it must agree.
 // "Write" covers Sonarr/Radarr and Trakt as well as Plex.
 const WRITE_TOOLS = [
@@ -26,7 +26,7 @@ describe("tools/list", () => {
     if (value === undefined) delete process.env[PLEX_MUTATIVE_OPS_ENV_VAR];
     else process.env[PLEX_MUTATIVE_OPS_ENV_VAR] = value;
 
-    expect(names()).toHaveLength(43);
+    expect(names()).toHaveLength(41);
     for (const tool of WRITE_TOOLS) expect(names()).not.toContain(tool);
   });
 

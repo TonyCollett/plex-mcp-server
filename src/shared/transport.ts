@@ -278,6 +278,56 @@ export function resolveAllowedHosts(bindHost: string, configured?: string): stri
   return isLoopbackHost(bindHost) ? LOOPBACK_HOSTNAMES : undefined;
 }
 
+/**
+ * Parse MCP_ALLOWED_ORIGINS: comma-separated origins (scheme://host[:port]),
+ * or "*" to accept any. Entries that don't parse are dropped with a warning.
+ */
+export function resolveAllowedOrigins(configured?: string): string[] {
+  const out: string[] = [];
+  for (const raw of (configured ?? "").split(",").map((o) => o.trim()).filter(Boolean)) {
+    if (raw === "*") {
+      out.push("*");
+      continue;
+    }
+    try {
+      out.push(new URL(raw).origin);
+    } catch {
+      console.error(`WARNING: ignoring MCP_ALLOWED_ORIGINS entry "${raw}": not an origin like https://app.example.com`);
+    }
+  }
+  return out;
+}
+
+/**
+ * Whether a request's Origin header may reach the endpoint.
+ *
+ * Browsers send Origin; MCP clients that aren't web pages send none, so a
+ * missing header passes. A web page is only let through when it is served
+ * from this machine (a loopback origin), from a name in the Host allow-list,
+ * or from an origin listed in MCP_ALLOWED_ORIGINS. This is what stops DNS
+ * rebinding when the server listens on all interfaces and the Host check is
+ * off: the rebound page's origin is its own hostname, which matches none of
+ * these.
+ */
+export function originAllowed(
+  origin: string | undefined,
+  allowedOrigins: readonly string[],
+  allowedHosts: readonly string[] | undefined
+): boolean {
+  if (origin === undefined) return true;
+  if (allowedOrigins.includes("*")) return true;
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    // Includes the opaque "null" origin of sandboxed frames and file:// pages.
+    return false;
+  }
+  if (allowedOrigins.includes(parsed.origin)) return true;
+  const hostname = parsed.hostname.toLowerCase();
+  return isLoopbackHost(hostname) || (allowedHosts?.includes(hostname) ?? false);
+}
+
 /** Constant-time check of an `Authorization: Bearer <token>` header. */
 export function bearerTokenMatches(header: string | undefined, expected: string): boolean {
   // Plain string parsing rather than a regex: the header is attacker-controlled,
@@ -307,6 +357,8 @@ export interface McpHandlerOptions {
   authToken?: string;
   /** Host header names to accept (lowercase, no port). Undefined accepts any. */
   allowedHosts?: string[];
+  /** Browser origins accepted besides loopback and allowedHosts; "*" accepts any. */
+  allowedOrigins?: string[];
   /** Ceiling on sessionless requests being served at once. Defaults to the session cap. */
   maxStatelessInFlight?: number;
 }
@@ -322,6 +374,7 @@ export function createMcpRequestHandler(options: McpHandlerOptions) {
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const mcpPath = normalizeMcpPath(options.mcpPath ?? DEFAULT_MCP_PATH);
   const { authToken, allowedHosts } = options;
+  const allowedOrigins = options.allowedOrigins ?? [];
   const maxStatelessInFlight = options.maxStatelessInFlight ?? DEFAULT_MAX_SESSIONS;
   let statelessInFlight = 0;
 
@@ -350,6 +403,17 @@ export function createMcpRequestHandler(options: McpHandlerOptions) {
         sendRpcError(res, 403, -32000, "Host not allowed");
         return;
       }
+    }
+
+    const origin = req.headers.origin;
+    if (!originAllowed(origin, allowedOrigins, allowedHosts)) {
+      sendRpcError(
+        res,
+        403,
+        -32000,
+        "Origin not allowed. To let a browser-based client in, add its origin to MCP_ALLOWED_ORIGINS."
+      );
+      return;
     }
 
     if (authToken && !bearerTokenMatches(req.headers.authorization, authToken)) {
@@ -427,19 +491,17 @@ export function createMcpRequestHandler(options: McpHandlerOptions) {
         return;
       }
       statelessInFlight++;
-      let released = false;
-      const release = () => {
-        if (released) return;
-        released = true;
+      // Released on close, registered before anything below can throw: a
+      // failing getServer() would otherwise hold the slot forever.
+      res.once("close", () => {
         statelessInFlight--;
-      };
+      });
       const stateless = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
       });
       const server = getServer();
-      res.on("close", () => {
-        release();
+      res.once("close", () => {
         void stateless.close().catch(() => {});
         void server.close().catch(() => {});
       });
@@ -499,12 +561,26 @@ export function createMcpRequestHandler(options: McpHandlerOptions) {
   };
 }
 
-function parseArgs(): { transport: TransportMode; port: number; mcpPath: string; host: string } {
-  const args = process.argv.slice(2);
+/**
+ * Transport settings from the command line and environment. The environment
+ * sets the defaults and an explicit flag beats it, so `--host 127.0.0.1`
+ * still works in the Docker image, which sets MCP_HOST=0.0.0.0.
+ */
+export function parseArgs(
+  args: readonly string[] = process.argv.slice(2),
+  env: NodeJS.ProcessEnv = process.env
+): { transport: TransportMode; port: number; mcpPath: string; host: string } {
   let transport: TransportMode = "stdio";
   let port = 3000;
-  let host = DEFAULT_HTTP_HOST;
-  let mcpPath = DEFAULT_MCP_PATH;
+  let host = env.MCP_HOST?.trim() || DEFAULT_HTTP_HOST;
+  let mcpPath = env.MCP_PATH ? normalizeMcpPath(env.MCP_PATH) : DEFAULT_MCP_PATH;
+
+  if (env.MCP_PORT) {
+    const envPort = parseInt(env.MCP_PORT, 10);
+    if (Number.isFinite(envPort) && envPort >= 1 && envPort <= 65535) {
+      port = envPort;
+    }
+  }
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--transport" && args[i + 1]) {
@@ -530,21 +606,6 @@ function parseArgs(): { transport: TransportMode; port: number; mcpPath: string;
       mcpPath = normalizeMcpPath(args[i + 1]);
       i++;
     }
-  }
-
-  if (process.env.MCP_PORT) {
-    const envPort = parseInt(process.env.MCP_PORT, 10);
-    if (Number.isFinite(envPort) && envPort >= 1 && envPort <= 65535) {
-      port = envPort;
-    }
-  }
-
-  if (process.env.MCP_PATH) {
-    mcpPath = normalizeMcpPath(process.env.MCP_PATH);
-  }
-
-  if (process.env.MCP_HOST) {
-    host = process.env.MCP_HOST.trim();
   }
 
   return { transport, port, mcpPath, host };
@@ -585,6 +646,7 @@ export async function startServer(
 
   const authToken = process.env.MCP_AUTH_TOKEN?.trim() || undefined;
   const allowedHosts = resolveAllowedHosts(host, process.env.MCP_ALLOWED_HOSTS);
+  const allowedOrigins = resolveAllowedOrigins(process.env.MCP_ALLOWED_ORIGINS);
 
   if (!authToken && !isLoopbackHost(host)) {
     console.error(
@@ -603,6 +665,7 @@ export async function startServer(
       mcpPath,
       authToken,
       allowedHosts,
+      allowedOrigins,
       maxStatelessInFlight: positiveIntFromEnv("MCP_MAX_SESSIONS", DEFAULT_MAX_SESSIONS),
     })
   );
@@ -619,7 +682,9 @@ export async function startServer(
     console.error(`${serverName} running on http://${shown}:${port}${mcpPath}`);
     console.error(
       `  auth: ${authToken ? "bearer token required" : "none"}; ` +
-        `Host check: ${allowedHosts ? allowedHosts.join(", ") : "off"}`
+        `Host check: ${allowedHosts ? allowedHosts.join(", ") : "off"}; ` +
+        `browser origins: loopback${allowedHosts ? " + allowed hosts" : ""}` +
+        `${allowedOrigins.length ? ` + ${allowedOrigins.join(", ")}` : ""}`
     );
   });
 }

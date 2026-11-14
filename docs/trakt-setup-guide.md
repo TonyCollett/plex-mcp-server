@@ -59,7 +59,9 @@ npm start
 
 ## Step 4: Authenticate with Trakt
 
-Once your MCP client is connected to the Trakt-enabled server, use these functions:
+Once your MCP client is connected to the Trakt-enabled server, use these functions.
+
+They are write tools, because completing the flow switches the Trakt account the whole server uses: they are only listed, and only run, with `PLEX_ENABLE_MUTATIVE_OPS=true`. If you only want read access to Trakt, enable it while you authenticate, set `TRAKT_TOKEN_FILE` so the login is saved, then turn it off again.
 
 ### 4.1 Initiate Authentication
 
@@ -185,8 +187,8 @@ Once authenticated, you have access to these Trakt functions:
 | `TRAKT_CLIENT_ID` | OAuth application client ID | Yes | - |
 | `TRAKT_CLIENT_SECRET` | OAuth application secret | Yes | - |
 | `TRAKT_REDIRECT_URI` | OAuth redirect URI | No | `urn:ietf:wg:oauth:2.0:oob` |
-| `TRAKT_ACCESS_TOKEN` | User access token (copy from the server log after `trakt_complete_auth`) | No | - |
-| `TRAKT_REFRESH_TOKEN` | User refresh token (copy from the server log after `trakt_complete_auth`) | No | - |
+| `TRAKT_ACCESS_TOKEN` | User access token (copy from `TRAKT_TOKEN_FILE` after `trakt_complete_auth`) | No | - |
+| `TRAKT_REFRESH_TOKEN` | User refresh token (copy from `TRAKT_TOKEN_FILE` after `trakt_complete_auth`) | No | - |
 | `TRAKT_TOKEN_FILE` | File that tokens are saved to after authentication and every refresh, and read back on start. Takes precedence over the two variables above. Recommended. | No | - |
 | `TRAKT_BASE_URL` | Custom API base URL | No | `https://api-v2launch.trakt.tv` |
 

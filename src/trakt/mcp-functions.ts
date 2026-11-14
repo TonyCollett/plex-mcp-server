@@ -21,6 +21,8 @@ export class TraktMCPFunctions {
   private syncEngine!: TraktSyncEngine;
   private mapper: PlexToTraktMapper;
   private isInitialized: boolean = false;
+  /** Whether the last write to TRAKT_TOKEN_FILE worked; undefined before any. */
+  private lastTokenSaveOk?: boolean;
 
   constructor(private plexClient: PlexAPIClient) {
     this.mapper = new PlexToTraktMapper();
@@ -65,7 +67,7 @@ export class TraktMCPFunctions {
       refreshToken: stored?.refreshToken ?? process.env.TRAKT_REFRESH_TOKEN,
       onTokensUpdated: tokenFile
         ? (tokens) => {
-            saveTraktTokens(tokenFile, {
+            this.lastTokenSaveOk = saveTraktTokens(tokenFile, {
               accessToken: tokens.access_token,
               refreshToken: tokens.refresh_token,
               createdAt: tokens.created_at,
@@ -126,16 +128,18 @@ export class TraktMCPFunctions {
     }
 
     try {
+      this.lastTokenSaveOk = undefined;
       const tokens = await this.traktClient.exchangeCodeForToken(code);
       const user = await this.traktClient.getCurrentUser();
 
       const tokenFile = traktTokenFilePath();
       const userInfo = { username: user.username, name: user.name, vip: user.vip };
 
-      // Tokens are kept out of the tool result: it lands in the model's
-      // context and the client's transcript. They go to the token file when
-      // one is configured, otherwise to the server log for the operator.
-      if (tokenFile) {
+      // Tokens never leave the process except into the token file: not into
+      // the tool result (it lands in the model's context and the client's
+      // transcript), and not into the server log (often shipped to shared
+      // log storage).
+      if (tokenFile && this.lastTokenSaveOk) {
         return {
           success: true,
           user: userInfo,
@@ -145,20 +149,28 @@ export class TraktMCPFunctions {
         };
       }
 
-      console.error(
-        '[trakt] Authentication succeeded. To persist it across restarts, add these to your MCP server environment:\n' +
-        `TRAKT_ACCESS_TOKEN=${tokens.access_token}\nTRAKT_REFRESH_TOKEN=${tokens.refresh_token}\n` +
-        '[trakt] Or set TRAKT_TOKEN_FILE so tokens are saved, and refreshed, automatically.'
-      );
+      if (tokenFile) {
+        return {
+          success: true,
+          user: userInfo,
+          tokenStorage: 'memory',
+          message: `Authentication succeeded, but the tokens could not be saved to ${tokenFile} (the server log says why). They work until this server process stops; each token refresh will try to save again.`,
+          expiresIn: tokens.expires_in,
+          nextSteps: [
+            `Make ${tokenFile} writable by the server (in Docker, a mounted volume owned by UID 1000), then authenticate again`,
+            'Use trakt_get_auth_status to verify authentication',
+          ],
+        };
+      }
+
       return {
         success: true,
         user: userInfo,
         tokenStorage: 'memory',
-        message: 'Authentication successful. The tokens are active for this server process but are not saved. They were written to the server log (stderr), not to this chat.',
+        message: 'Authentication successful. The tokens work until this server process stops; they are not saved anywhere.',
         expiresIn: tokens.expires_in,
         nextSteps: [
-          'Recommended: set TRAKT_TOKEN_FILE to a writable path and authenticate again, so tokens persist and refresh automatically',
-          'Or copy TRAKT_ACCESS_TOKEN and TRAKT_REFRESH_TOKEN from the server log into your MCP server environment',
+          'To keep the login across restarts, set TRAKT_TOKEN_FILE to a writable path and authenticate again. Tokens are saved there and refreshed automatically',
           'Use trakt_get_auth_status to verify authentication',
         ]
       };
