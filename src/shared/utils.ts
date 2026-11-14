@@ -117,9 +117,11 @@ export function validatePlexTotalSize(
   return validated as { MediaContainer?: { Metadata?: Record<string, unknown>[]; totalSize?: number } };
 }
 
-/** True for an IPv4 address in a loopback, private, link-local, CGNAT or unspecified range. */
+/** True for an IPv4 address that is not on the public internet: unspecified,
+ *  private, loopback, CGNAT, link-local, IETF/benchmark/documentation ranges,
+ *  multicast and reserved. */
 function isNonPublicIPv4(ip: string): boolean {
-  const [a, b] = ip.split(".").map(Number);
+  const [a, b, c] = ip.split(".").map(Number);
   return (
     a === 0 ||
     a === 10 ||
@@ -127,26 +129,64 @@ function isNonPublicIPv4(ip: string): boolean {
     (a === 100 && b >= 64 && b <= 127) ||
     (a === 169 && b === 254) ||
     (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 0 && (c === 0 || c === 2)) ||
     (a === 192 && b === 168) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    (a === 198 && b === 51 && c === 100) ||
+    (a === 203 && b === 0 && c === 113) ||
     a >= 224
   );
 }
 
-function isNonPublicIPv6(ip: string): boolean {
-  const h = ip.toLowerCase();
-  if (h === "::" || h === "::1") return true;
-  // IPv4-mapped (::ffff:a.b.c.d). URL parsing rewrites the dotted part as
-  // two hex groups, e.g. ::ffff:7f00:1 for 127.0.0.1, so accept both forms.
-  const dotted = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(h);
-  if (dotted) return isNonPublicIPv4(dotted[1]);
-  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(h);
-  if (hex) {
-    const hi = parseInt(hex[1], 16);
-    const lo = parseInt(hex[2], 16);
-    return isNonPublicIPv4(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+/** The eight 16-bit groups of an IPv6 address (already validated by isIP). */
+function ipv6Groups(ip: string): number[] {
+  let text = ip.toLowerCase();
+  // A trailing dotted IPv4 part (::ffff:1.2.3.4) becomes two hex groups.
+  const dotted = /(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(text);
+  if (dotted) {
+    const [, a, b, c, d] = dotted.map(Number);
+    text = `${text.slice(0, dotted.index)}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
   }
-  return /^f[cd]/.test(h) || /^fe[89ab]/.test(h) || h.startsWith("ff");
+  const [head, tail] = text.includes("::") ? text.split("::") : [text, undefined];
+  const left = head ? head.split(":") : [];
+  const right = tail ? tail.split(":") : [];
+  const fill = tail === undefined ? [] : Array(8 - left.length - right.length).fill("0");
+  return [...left, ...fill, ...right].map((g) => parseInt(g, 16));
 }
+
+function ipv4FromGroups(hi: number, lo: number): string {
+  return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+}
+
+function isNonPublicIPv6(ip: string): boolean {
+  const g = ipv6Groups(ip);
+  const zeros = (n: number) => g.slice(0, n).every((x) => x === 0);
+
+  // ::/96 covers ::, ::1 and IPv4-compatible addresses; ::ffff:0:0/96 is
+  // IPv4-mapped. URL parsing turns ::127.0.0.1 into ::7f00:1, so both forms
+  // arrive here as groups.
+  if (zeros(6) || (zeros(5) && g[5] === 0xffff)) return isNonPublicIPv4(ipv4FromGroups(g[6], g[7]));
+  // NAT64 well-known prefix 64:ff9b::/96 reaches the embedded IPv4 address.
+  if (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every((x) => x === 0)) {
+    return isNonPublicIPv4(ipv4FromGroups(g[6], g[7]));
+  }
+  // 6to4 (2002::/16) embeds the IPv4 address in groups 1-2.
+  if (g[0] === 0x2002) return isNonPublicIPv4(ipv4FromGroups(g[1], g[2]));
+
+  return (
+    (g[0] === 0x64 && g[1] === 0xff9b && g[2] === 1) || // 64:ff9b:1::/48 local NAT64
+    (g[0] === 0x100 && zeros(4)) || // 100::/64 discard
+    (g[0] === 0x2001 && g[1] === 0) || // 2001::/32 Teredo
+    (g[0] === 0x2001 && g[1] === 0xdb8) || // 2001:db8::/32 documentation
+    (g[0] & 0xfe00) === 0xfc00 || // fc00::/7 unique local
+    (g[0] & 0xffc0) === 0xfe80 || // fe80::/10 link-local
+    (g[0] & 0xffc0) === 0xfec0 || // fec0::/10 site-local (deprecated)
+    (g[0] & 0xff00) === 0xff00 // ff00::/8 multicast
+  );
+}
+
+/** Name suffixes that only resolve inside a private network. */
+const PRIVATE_NAME_SUFFIXES = [".localhost", ".local", ".internal", ".lan", ".home", ".home.arpa", ".intranet", ".corp", ".private"];
 
 /**
  * Why a poster URL is refused, or undefined when it is acceptable.
@@ -170,11 +210,17 @@ export function posterUrlProblem(raw: string): string | undefined {
   if (url.username || url.password) {
     return "poster url must not contain credentials";
   }
-  const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) {
+  // Drop IPv6 brackets and any trailing dots: "localhost." is still localhost.
+  const host = url.hostname.replace(/^\[|\]$/g, "").replace(/\.+$/, "").toLowerCase();
+  const family = isIP(host);
+  // A name with no dot ("router", "nas") resolves through the local search
+  // domain, so it is as internal as the suffixes below.
+  if (
+    family === 0 &&
+    (host === "localhost" || !host.includes(".") || PRIVATE_NAME_SUFFIXES.some((s) => host.endsWith(s)))
+  ) {
     return "poster url must point at a public host";
   }
-  const family = isIP(host);
   if ((family === 4 && isNonPublicIPv4(host)) || (family === 6 && isNonPublicIPv6(host))) {
     return "poster url must point at a public address";
   }

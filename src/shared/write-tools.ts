@@ -1,6 +1,8 @@
 /**
  * Non-Plex tools that change state somewhere: Sonarr/Radarr (adding media,
- * starting downloads, editing tags) and Trakt (writing watch history, scrobbling).
+ * starting downloads, editing tags) and Trakt (writing watch history,
+ * scrobbling, and the OAuth flow, which replaces the Trakt account every
+ * session uses and overwrites TRAKT_TOKEN_FILE).
  *
  * They sit behind the same PLEX_ENABLE_MUTATIVE_OPS switch as the Plex write
  * tools, so "write operations disabled" means disabled everywhere: hidden from
@@ -22,6 +24,8 @@ export const ARR_WRITE_TOOLS: readonly string[] = [
 ];
 
 export const TRAKT_WRITE_TOOLS: readonly string[] = [
+  "trakt_authenticate",
+  "trakt_complete_auth",
   "trakt_sync_to_trakt",
   "trakt_start_scrobbling",
 ];

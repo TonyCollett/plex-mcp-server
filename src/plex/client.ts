@@ -4,7 +4,7 @@
  * Implements PlexAPIClient interface for Trakt sync compatibility.
  */
 
-import axios, { AxiosRequestConfig } from "axios";
+import axios, { AxiosError, AxiosRequestConfig } from "axios";
 import { PlexConfig, LibraryMovieRecord } from "./types.js";
 import { PLEX_TYPE_IDS, PLEX_CONTAINER_SIZE, PLEX_MAX_PAGES } from "./constants.js";
 import { PlexAPIClient } from "../trakt/sync.js";
@@ -38,12 +38,42 @@ export class PlexClient implements PlexAPIClient {
       },
       params,
       timeout: this.config.requestTimeoutMs,
-      // A redirect would carry X-Plex-Token to wherever it points: axios
-      // strips Authorization on a cross-host redirect, but not custom headers.
-      maxRedirects: 0,
     };
 
-    return this.timed(method, endpoint, async () => (await axios(url, axiosConfig)).data);
+    return this.timed(method, endpoint, () => this.send(url, axiosConfig));
+  }
+
+  /**
+   * The one place requests carrying X-Plex-Token go out. Redirects are not
+   * followed: one would carry the token to wherever it points, since axios
+   * strips Authorization on a cross-host redirect but not custom headers.
+   * A redirect is reported with where it pointed, so a PLEX_URL that needs
+   * changing (http -> https, say) is easy to spot.
+   */
+  private async send(url: string, config: AxiosRequestConfig): Promise<Record<string, unknown>> {
+    try {
+      return (await axios(url, { ...config, maxRedirects: 0 })).data;
+    } catch (error) {
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (status !== undefined && status >= 300 && status < 400) {
+        const location = (error as AxiosError).response?.headers?.location;
+        let target = "an unknown location";
+        try {
+          // Origin and path only: a query string could carry anything.
+          if (typeof location === "string") {
+            const u = new URL(location, url);
+            target = `${u.origin}${u.pathname}`;
+          }
+        } catch {
+          // keep the default
+        }
+        throw new Error(
+          `Plex answered with a redirect (HTTP ${status}) to ${target}, which is not followed so the Plex token isn't sent elsewhere. ` +
+            "If that is your server's real address, set PLEX_URL to it."
+        );
+      }
+      throw error;
+    }
   }
 
   /**
@@ -78,8 +108,8 @@ export class PlexClient implements PlexAPIClient {
     params: Record<string, string | number> = {},
     method: string = "GET"
   ): Promise<Record<string, unknown>> {
-    return this.timed(method, `discover:${endpoint}`, async () => {
-      const response = await axios(`${PLEX_DISCOVER_BASE_URL}${endpoint}`, {
+    return this.timed(method, `discover:${endpoint}`, () =>
+      this.send(`${PLEX_DISCOVER_BASE_URL}${endpoint}`, {
         method,
         headers: {
           "X-Plex-Token": this.config.token,
@@ -89,9 +119,8 @@ export class PlexClient implements PlexAPIClient {
         },
         params,
         timeout: this.config.requestTimeoutMs,
-      });
-      return response.data;
-    });
+      })
+    );
   }
 
   getPlexTypeId(type: string): number {

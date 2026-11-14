@@ -5,7 +5,7 @@
 
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { createWriteStream } from "node:fs";
-import { mkdir, realpath, rm } from "node:fs/promises";
+import { lstat, mkdir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { PlexClient } from "./client.js";
 import { MCPResponse, LibraryMovieRecord, TasteProfile } from "./types.js";
@@ -264,17 +264,22 @@ export class PlexTools {
       exportPath = path.join(baseExportDir, `library_${libraryKey}_${Date.now()}.json`);
     }
 
-    await mkdir(path.dirname(exportPath), { recursive: true });
-
     // The string check above can't see symlinks: exports/link -> /etc would
-    // pass it. Compare real paths once the directories exist.
-    const [realBase, realParent] = await Promise.all([
-      realpath(baseExportDir),
-      realpath(path.dirname(exportPath)),
-    ]);
-    if (realParent !== realBase && !realParent.startsWith(`${realBase}${path.sep}`)) {
-      throw new McpError(ErrorCode.InvalidRequest, "outputPath must resolve inside the exports directory");
-    }
+    // pass it. Resolve real paths, and do it before creating anything, since
+    // mkdir would follow the link and create directories outside the base.
+    // The base itself is operator configuration, so it is created as given.
+    await mkdir(baseExportDir, { recursive: true });
+    const realBase = await realpath(baseExportDir);
+    const assertInsideBase = (realDir: string) => {
+      if (realDir !== realBase && !realDir.startsWith(`${realBase}${path.sep}`)) {
+        throw new McpError(ErrorCode.InvalidRequest, "outputPath must resolve inside the exports directory");
+      }
+    };
+    const exportDir = path.dirname(exportPath);
+    assertInsideBase(await this.realpathOfDeepestExisting(exportDir));
+    await mkdir(exportDir, { recursive: true });
+    // Checked again in case a link was swapped in while the directories were made.
+    assertInsideBase(await realpath(exportDir));
 
     const safePageSize =
       Number.isFinite(pageSize) && pageSize > 0 ? Math.floor(pageSize) : DEFAULT_LIMITS.exportPageSize;
@@ -1645,6 +1650,30 @@ export class PlexTools {
   }
 
   // ── Private helpers ─────────────────────────────────────────
+
+  /**
+   * Real path of the deepest part of `dir` that already exists. An entry that
+   * exists but can't be resolved (a dangling symlink) is refused rather than
+   * skipped: mkdir would otherwise create its target.
+   */
+  private async realpathOfDeepestExisting(dir: string): Promise<string> {
+    let probe = dir;
+    for (;;) {
+      try {
+        await lstat(probe);
+      } catch (error) {
+        const parent = path.dirname(probe);
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT" || parent === probe) throw error;
+        probe = parent;
+        continue;
+      }
+      try {
+        return await realpath(probe);
+      } catch {
+        throw new McpError(ErrorCode.InvalidRequest, "outputPath must resolve inside the exports directory");
+      }
+    }
+  }
 
   private async writeToStream(stream: ReturnType<typeof createWriteStream>, chunk: string): Promise<void> {
     if (stream.write(chunk)) {

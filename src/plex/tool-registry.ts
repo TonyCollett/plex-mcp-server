@@ -23,7 +23,7 @@ type ToolRegistryOptions = {
 export const MAX_TOOL_PAGE_SIZE = 10_000;
 
 /** Wrap a handler so it refuses to run unless write operations are enabled. */
-export function guardMutativeOp(handler: ToolHandler): ToolHandler {
+function guardMutativeOp(handler: ToolHandler): ToolHandler {
   return async (args: Record<string, unknown>) => {
     if (!isMutativeOpsEnabled()) {
       throw new McpError(
@@ -49,9 +49,20 @@ function clampPageSizes(args: Record<string, unknown>): Record<string, unknown> 
 
 export class ToolRegistry {
   private handlers = new Map<string, ToolHandler>();
+  private writeTools: ReadonlySet<string>;
+
+  /**
+   * @param options.writeTools names whose handlers are wrapped in
+   *   guardMutativeOp on registration, so they refuse to run unless
+   *   PLEX_ENABLE_MUTATIVE_OPS=true. Gating by name here means a write tool
+   *   can't be registered without its guard.
+   */
+  constructor(options: { writeTools?: Iterable<string> } = {}) {
+    this.writeTools = new Set(options.writeTools ?? []);
+  }
 
   register(name: string, handler: ToolHandler): void {
-    this.handlers.set(name, handler);
+    this.handlers.set(name, this.writeTools.has(name) ? guardMutativeOp(handler) : handler);
   }
 
   has(name: string): boolean {

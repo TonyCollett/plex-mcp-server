@@ -27,7 +27,7 @@ This MCP server transforms your Plex Media Server into an AI-queryable database.
 
 ## Features
 
-**43 tools** out of the box (67 with write operations enabled):
+**41 tools** out of the box (67 with write operations enabled):
 
 - **Plex Library Management** — Browse libraries, search media, get detailed metadata, list playlists and watchlist
 - **Tautulli-Style Analytics** — Viewing statistics, user activity, popular content, watch history
@@ -97,14 +97,22 @@ token (and your Sonarr/Radarr/Trakt credentials, if set). To lock it down:
   When the server listens on loopback and this is unset, only `localhost`,
   `127.0.0.1` and `[::1]` are accepted, which blocks DNS-rebinding attacks from
   web pages.
+- **`MCP_ALLOWED_ORIGINS`** — comma-separated browser origins allowed to call
+  the endpoint, e.g. `https://inspector.example.com`, or `*` for any. Requests
+  without an `Origin` header (ordinary MCP clients) are unaffected; a web page
+  is only let in when its origin is loopback, one of `MCP_ALLOWED_HOSTS`, or
+  listed here. This keeps DNS rebinding blocked even on `0.0.0.0` (the Docker
+  default), where the Host check is off.
 
 If your MCP client can't send custom headers, put the server behind a reverse
 proxy that authenticates, or use a long random `MCP_PATH` as a shared secret.
 
 Set `MCP_PORT` to listen on a different port, and `MCP_PATH` to serve MCP
 somewhere other than `/mcp` (for example `/plex/mcp` behind a reverse proxy).
-Outside Docker, the `--host`, `--port` and `--path` flags do the same. The
-health check stays at `/health` and needs no token.
+The `--host`, `--port` and `--path` flags do the same and win over the
+variables when both are given. In Docker, prefer `MCP_PORT` over `--port`:
+the container's health check reads `MCP_PORT`. The health check stays at
+`/health` and needs no token.
 
 `export_library` writes to `/app/exports` in the container. Mount a volume
 there (`-v plex-mcp-exports:/app/exports`) to keep the files.
@@ -159,7 +167,7 @@ The optional Trakt, Sonarr and Radarr variables from
 
 > **Trakt.tv setup** requires a [Trakt OAuth application](https://trakt.tv/oauth/applications). Create one with redirect URI `urn:ietf:wg:oauth:2.0:oob`, then add the Client ID and Secret to your config. Once the server is running, ask your AI assistant to "authenticate with Trakt" — it will guide you through the OAuth flow. See the [Trakt setup guide](docs/trakt-setup-guide.md) for detailed instructions.
 
-> **Keeping the Trakt login:** set `TRAKT_TOKEN_FILE` to a writable path (e.g. `/app/exports/trakt-tokens.json` in Docker, on a mounted volume). Tokens from `trakt_complete_auth` and every later refresh are saved there with owner-only permissions and reused on restart. Without it, the tokens are written to the server log (stderr), never to the chat, and you copy them into `TRAKT_ACCESS_TOKEN`/`TRAKT_REFRESH_TOKEN` yourself. Trakt refresh tokens are single-use, so env-only tokens stop working after the first refresh once the server restarts.
+> **Keeping the Trakt login:** set `TRAKT_TOKEN_FILE` to a writable path (e.g. `/app/exports/trakt-tokens.json` in Docker, on a mounted volume). Tokens from `trakt_complete_auth` and every later refresh are saved there with owner-only permissions and reused on restart. Without it, the login only lasts until the server stops: tokens are never shown in the chat or written to the log. If you'd rather keep them in `TRAKT_ACCESS_TOKEN`/`TRAKT_REFRESH_TOKEN`, authenticate once with a token file set and copy them from it. Trakt refresh tokens are single-use, so env-only tokens stop working after the first refresh once the server restarts.
 
 ### Compact Responses (optional)
 
@@ -262,7 +270,7 @@ Once configured, you can ask your AI assistant:
 
 ## Available Functions
 
-43 tools out of the box (67 with write operations enabled). Tools marked **(write)** are only listed, and only run, with `PLEX_ENABLE_MUTATIVE_OPS=true`.
+41 tools out of the box (67 with write operations enabled). Tools marked **(write)** are only listed, and only run, with `PLEX_ENABLE_MUTATIVE_OPS=true`.
 
 ### Plex Tools (21 tools)
 
@@ -353,8 +361,8 @@ Set `PLEX_ENABLE_MUTATIVE_OPS=true` to enable these tools. The same switch enabl
 
 | Function | Description |
 |----------|-------------|
-| `trakt_authenticate` | Start Trakt.tv OAuth flow |
-| `trakt_complete_auth` | Complete authentication |
+| `trakt_authenticate` | **(write)** Start Trakt.tv OAuth flow |
+| `trakt_complete_auth` | **(write)** Complete authentication (switches the server to that Trakt account) |
 | `trakt_get_auth_status` | Check auth status |
 | `trakt_sync_to_trakt` | **(write)** Sync Plex history to Trakt |
 | `trakt_sync_from_trakt` | Get Trakt data for comparison |
@@ -498,6 +506,7 @@ Merged contributors are credited in [CONTRIBUTORS.md](CONTRIBUTORS.md). Please u
 
 **Trakt authentication issues:**
 - Ensure `TRAKT_CLIENT_ID` and `TRAKT_CLIENT_SECRET` are both set
+- The OAuth tools are write tools: set `PLEX_ENABLE_MUTATIVE_OPS=true` while you authenticate (with `TRAKT_TOKEN_FILE` set, you can turn it off again afterwards)
 - Use the `trakt_authenticate` tool to start the OAuth flow
 - Complete authentication with `trakt_complete_auth` using the code from Trakt
 

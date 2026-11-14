@@ -3,28 +3,26 @@
  * Reuses ToolRegistry class from plex/tool-registry.ts.
  */
 
-import { ToolRegistry, guardMutativeOp } from "../plex/tool-registry.js";
+import { ToolRegistry } from "../plex/tool-registry.js";
 import { ARR_WRITE_TOOLS } from "../shared/write-tools.js";
 import { ArrMCPFunctions } from "./mcp-functions.js";
 import { formatToolPayload } from "../shared/output-format.js";
 
 export function createArrToolRegistry(arrFunctions: ArrMCPFunctions): ToolRegistry {
-  const registry = new ToolRegistry();
   // Write tools refuse to run unless PLEX_ENABLE_MUTATIVE_OPS=true.
-  const register: ToolRegistry["register"] = (name, handler) =>
-    registry.register(name, ARR_WRITE_TOOLS.includes(name) ? guardMutativeOp(handler) : handler);
+  const registry = new ToolRegistry({ writeTools: ARR_WRITE_TOOLS });
 
   // ──── Sonarr tools ────
 
-  register("sonarr_get_series", (args) =>
+  registry.register("sonarr_get_series", (args) =>
     arrFunctions.sonarrGetSeries({ filter: args.filter as string | undefined, limit: args.limit as number | undefined }).then(wrapResponse)
   );
 
-  register("sonarr_search", (args) =>
+  registry.register("sonarr_search", (args) =>
     arrFunctions.sonarrSearch({ query: args.query as string, limit: args.limit as number | undefined }).then(wrapResponse)
   );
 
-  register("sonarr_add_series", (args) =>
+  registry.register("sonarr_add_series", (args) =>
     arrFunctions.sonarrAddSeries({
       tvdbId: args.tvdbId as number,
       title: args.title as string,
@@ -40,18 +38,18 @@ export function createArrToolRegistry(arrFunctions: ArrMCPFunctions): ToolRegist
     }).then(wrapResponse)
   );
 
-  register("sonarr_get_missing", (args) =>
+  registry.register("sonarr_get_missing", (args) =>
     arrFunctions.sonarrGetMissing({
       page: args.page as number | undefined,
       pageSize: args.pageSize as number | undefined,
     }).then(wrapResponse)
   );
 
-  register("sonarr_get_queue", (args) =>
+  registry.register("sonarr_get_queue", (args) =>
     arrFunctions.sonarrGetQueue({ limit: args.limit as number | undefined }).then(wrapResponse)
   );
 
-  register("sonarr_get_calendar", (args) =>
+  registry.register("sonarr_get_calendar", (args) =>
     arrFunctions.sonarrGetCalendar({
       startDate: args.startDate as string | undefined,
       endDate: args.endDate as string | undefined,
@@ -59,43 +57,43 @@ export function createArrToolRegistry(arrFunctions: ArrMCPFunctions): ToolRegist
     }).then(wrapResponse)
   );
 
-  register("sonarr_get_profiles", () =>
+  registry.register("sonarr_get_profiles", () =>
     arrFunctions.sonarrGetProfiles().then(wrapResponse)
   );
 
-  register("sonarr_trigger_search", (args) =>
+  registry.register("sonarr_trigger_search", (args) =>
     arrFunctions.sonarrTriggerSearch({
       seriesId: args.seriesId as number | undefined,
     }).then(wrapResponse)
   );
 
-  register("sonarr_get_tags", () =>
+  registry.register("sonarr_get_tags", () =>
     arrFunctions.sonarrGetTags().then(wrapResponse)
   );
 
-  register("sonarr_create_tag", (args) =>
+  registry.register("sonarr_create_tag", (args) =>
     arrFunctions.sonarrCreateTag({ label: args.label as string }).then(wrapResponse)
   );
 
-  register("sonarr_update_tag", (args) =>
+  registry.register("sonarr_update_tag", (args) =>
     arrFunctions.sonarrUpdateTag({ id: args.id as number, label: args.label as string }).then(wrapResponse)
   );
 
-  register("sonarr_delete_tag", (args) =>
+  registry.register("sonarr_delete_tag", (args) =>
     arrFunctions.sonarrDeleteTag({ id: args.id as number }).then(wrapResponse)
   );
 
   // ──── Radarr tools ────
 
-  register("radarr_get_movies", (args) =>
+  registry.register("radarr_get_movies", (args) =>
     arrFunctions.radarrGetMovies({ filter: args.filter as string | undefined, limit: args.limit as number | undefined }).then(wrapResponse)
   );
 
-  register("radarr_search", (args) =>
+  registry.register("radarr_search", (args) =>
     arrFunctions.radarrSearch({ query: args.query as string, limit: args.limit as number | undefined }).then(wrapResponse)
   );
 
-  register("radarr_add_movie", (args) =>
+  registry.register("radarr_add_movie", (args) =>
     arrFunctions.radarrAddMovie({
       tmdbId: args.tmdbId as number,
       title: args.title as string,
@@ -109,18 +107,18 @@ export function createArrToolRegistry(arrFunctions: ArrMCPFunctions): ToolRegist
     }).then(wrapResponse)
   );
 
-  register("radarr_get_missing", (args) =>
+  registry.register("radarr_get_missing", (args) =>
     arrFunctions.radarrGetMissing({
       page: args.page as number | undefined,
       pageSize: args.pageSize as number | undefined,
     }).then(wrapResponse)
   );
 
-  register("radarr_get_queue", (args) =>
+  registry.register("radarr_get_queue", (args) =>
     arrFunctions.radarrGetQueue({ limit: args.limit as number | undefined }).then(wrapResponse)
   );
 
-  register("radarr_get_calendar", (args) =>
+  registry.register("radarr_get_calendar", (args) =>
     arrFunctions.radarrGetCalendar({
       startDate: args.startDate as string | undefined,
       endDate: args.endDate as string | undefined,
@@ -128,35 +126,35 @@ export function createArrToolRegistry(arrFunctions: ArrMCPFunctions): ToolRegist
     }).then(wrapResponse)
   );
 
-  register("radarr_get_profiles", () =>
+  registry.register("radarr_get_profiles", () =>
     arrFunctions.radarrGetProfiles().then(wrapResponse)
   );
 
-  register("radarr_trigger_search", (args) =>
+  registry.register("radarr_trigger_search", (args) =>
     arrFunctions.radarrTriggerSearch({
       movieId: args.movieId as number | undefined,
     }).then(wrapResponse)
   );
 
-  register("radarr_get_tags", () =>
+  registry.register("radarr_get_tags", () =>
     arrFunctions.radarrGetTags().then(wrapResponse)
   );
 
-  register("radarr_create_tag", (args) =>
+  registry.register("radarr_create_tag", (args) =>
     arrFunctions.radarrCreateTag({ label: args.label as string }).then(wrapResponse)
   );
 
-  register("radarr_update_tag", (args) =>
+  registry.register("radarr_update_tag", (args) =>
     arrFunctions.radarrUpdateTag({ id: args.id as number, label: args.label as string }).then(wrapResponse)
   );
 
-  register("radarr_delete_tag", (args) =>
+  registry.register("radarr_delete_tag", (args) =>
     arrFunctions.radarrDeleteTag({ id: args.id as number }).then(wrapResponse)
   );
 
   // ──── Cross-service tools ────
 
-  register("arr_get_status", () =>
+  registry.register("arr_get_status", () =>
     arrFunctions.arrGetStatus().then(wrapResponse)
   );
 
