@@ -11,6 +11,8 @@ export interface TraktConfig {
   redirectUri: string;
   accessToken?: string;
   refreshToken?: string;
+  /** Called with fresh tokens after a code exchange or a refresh. */
+  onTokensUpdated?: (tokens: TraktTokens) => void;
 }
 
 export interface TraktTokens {

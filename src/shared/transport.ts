@@ -9,7 +9,7 @@
  * the second client fail with "already initialized".
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -34,6 +34,14 @@ export const DEFAULT_SESSION_IDLE_MS = 300_000;
 /** Ceiling on concurrent sessions. Each session holds a Server instance, so
  *  this bounds memory against a client that never reuses its session ID. */
 export const DEFAULT_MAX_SESSIONS = 64;
+
+/** Address the HTTP transport binds to unless --host or MCP_HOST says otherwise.
+ *  Loopback by default: the endpoint exposes every tool, so listening on all
+ *  interfaces has to be asked for (the Docker image sets MCP_HOST=0.0.0.0). */
+export const DEFAULT_HTTP_HOST = "127.0.0.1";
+
+/** Host header names accepted when bound to loopback with no explicit allow-list. */
+const LOOPBACK_HOSTNAMES = ["localhost", "127.0.0.1", "[::1]"];
 
 /** How often the idle sweeper runs. */
 export const SESSION_SWEEP_INTERVAL_MS = 30_000;
@@ -232,6 +240,55 @@ function sendRpcError(res: ServerResponse, status: number, code: number, message
   sendJson(res, status, { jsonrpc: "2.0", error: { code, message }, id: null });
 }
 
+/** True for an address that only accepts connections from this machine. */
+export function isLoopbackHost(host: string): boolean {
+  const h = host.replace(/^\[|\]$/g, "").toLowerCase();
+  return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+/**
+ * Hostname from a Host header, lowercased and without its port, or undefined
+ * when the header is missing or does not parse. IPv6 keeps its brackets.
+ */
+export function hostnameFromHeader(header: string | undefined): string | undefined {
+  if (!header) return undefined;
+  try {
+    return new URL(`http://${header}`).hostname.toLowerCase() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Which Host header names the MCP endpoint answers to, or undefined for "any".
+ *
+ * An explicit list always wins. Without one, a loopback bind only answers to
+ * loopback names: that is what stops DNS rebinding, where a web page points
+ * its own hostname at 127.0.0.1 and then talks to this server as same-origin.
+ * A bind on a real interface is reached under whatever name the network gives
+ * it, so it accepts any Host unless MCP_ALLOWED_HOSTS narrows it.
+ */
+export function resolveAllowedHosts(bindHost: string, configured?: string): string[] | undefined {
+  const list = (configured ?? "")
+    .split(",")
+    .map((h) => h.trim())
+    .filter(Boolean)
+    .map((h) => hostnameFromHeader(h) ?? h.toLowerCase());
+  if (list.length > 0) return list;
+  return isLoopbackHost(bindHost) ? LOOPBACK_HOSTNAMES : undefined;
+}
+
+/** Constant-time check of an `Authorization: Bearer <token>` header. */
+export function bearerTokenMatches(header: string | undefined, expected: string): boolean {
+  const match = /^Bearer\s+(.+)$/i.exec(header ?? "");
+  if (!match) return false;
+  // Hash both sides so the comparison is fixed-length and leaks nothing about
+  // the token's length.
+  const a = createHash("sha256").update(match[1].trim()).digest();
+  const b = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(a, b);
+}
+
 export interface McpHandlerOptions {
   /** Called once per new session to build a dedicated Server instance. */
   getServer: () => Server;
@@ -240,6 +297,12 @@ export interface McpHandlerOptions {
   maxBodyBytes?: number;
   /** Path the MCP endpoint is served on. Defaults to DEFAULT_MCP_PATH. */
   mcpPath?: string;
+  /** When set, every MCP request must send `Authorization: Bearer <authToken>`. */
+  authToken?: string;
+  /** Host header names to accept (lowercase, no port). Undefined accepts any. */
+  allowedHosts?: string[];
+  /** Ceiling on sessionless requests being served at once. Defaults to the session cap. */
+  maxStatelessInFlight?: number;
 }
 
 /**
@@ -252,9 +315,14 @@ export function createMcpRequestHandler(options: McpHandlerOptions) {
   const { getServer, serverName, store } = options;
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const mcpPath = normalizeMcpPath(options.mcpPath ?? DEFAULT_MCP_PATH);
+  const { authToken, allowedHosts } = options;
+  const maxStatelessInFlight = options.maxStatelessInFlight ?? DEFAULT_MAX_SESSIONS;
+  let statelessInFlight = 0;
 
-  return async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // Fixed base: only the path is wanted here, and a client-supplied Host
+    // header that fails to parse (e.g. "[") would otherwise throw.
+    const url = new URL(req.url || "/", "http://localhost");
 
     if (url.pathname === HEALTH_PATH && req.method === "GET") {
       sendJson(res, 200, { status: "ok", server: serverName, sessions: store.size });
@@ -267,6 +335,20 @@ export function createMcpRequestHandler(options: McpHandlerOptions) {
         error: "Not Found",
         message: `Use POST ${mcpPath} for MCP requests, or GET ${HEALTH_PATH} for health check`,
       });
+      return;
+    }
+
+    if (allowedHosts) {
+      const hostname = hostnameFromHeader(req.headers.host);
+      if (!hostname || !allowedHosts.includes(hostname)) {
+        sendRpcError(res, 403, -32000, "Host not allowed");
+        return;
+      }
+    }
+
+    if (authToken && !bearerTokenMatches(req.headers.authorization, authToken)) {
+      res.setHeader("WWW-Authenticate", 'Bearer realm="mcp"');
+      sendRpcError(res, 401, -32001, "Unauthorized");
       return;
     }
 
@@ -332,12 +414,26 @@ export function createMcpRequestHandler(options: McpHandlerOptions) {
     // initialized") and the client gives up. Serve it with a throwaway Server
     // and transport that are closed once the response is sent.
     if (!containsInitialize(body)) {
+      // These bypass the session store, so bound them separately: each one
+      // builds a Server of its own.
+      if (statelessInFlight >= maxStatelessInFlight) {
+        sendRpcError(res, 503, -32000, "Server busy, try again later");
+        return;
+      }
+      statelessInFlight++;
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        statelessInFlight--;
+      };
       const stateless = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
       });
       const server = getServer();
       res.on("close", () => {
+        release();
         void stateless.close().catch(() => {});
         void server.close().catch(() => {});
       });
@@ -379,13 +475,29 @@ export function createMcpRequestHandler(options: McpHandlerOptions) {
         throw error;
       }
     }
+  }
+
+  // An exception escaping an async request listener is an unhandled
+  // rejection, which terminates the process. Answer 500 instead.
+  return async function safeHandle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    try {
+      await handle(req, res);
+    } catch (error) {
+      console.error("HTTP handler error:", error instanceof Error ? error.message : error);
+      if (!res.headersSent) {
+        sendRpcError(res, 500, -32603, "Internal server error");
+      } else {
+        res.destroy();
+      }
+    }
   };
 }
 
-function parseArgs(): { transport: TransportMode; port: number; mcpPath: string } {
+function parseArgs(): { transport: TransportMode; port: number; mcpPath: string; host: string } {
   const args = process.argv.slice(2);
   let transport: TransportMode = "stdio";
   let port = 3000;
+  let host = DEFAULT_HTTP_HOST;
   let mcpPath = DEFAULT_MCP_PATH;
 
   for (let i = 0; i < args.length; i++) {
@@ -402,6 +514,10 @@ function parseArgs(): { transport: TransportMode; port: number; mcpPath: string 
       if (!Number.isFinite(port) || port < 1 || port > 65535) {
         throw new Error(`Invalid port: ${args[i + 1]}`);
       }
+      i++;
+    }
+    if (args[i] === "--host" && args[i + 1]) {
+      host = args[i + 1];
       i++;
     }
     if (args[i] === "--path" && args[i + 1]) {
@@ -421,7 +537,11 @@ function parseArgs(): { transport: TransportMode; port: number; mcpPath: string 
     mcpPath = normalizeMcpPath(process.env.MCP_PATH);
   }
 
-  return { transport, port, mcpPath };
+  if (process.env.MCP_HOST) {
+    host = process.env.MCP_HOST.trim();
+  }
+
+  return { transport, port, mcpPath, host };
 }
 
 function positiveIntFromEnv(name: string, fallback: number): number {
@@ -441,7 +561,7 @@ export async function startServer(
   getServer: () => Server,
   serverName: string
 ): Promise<void> {
-  const { transport, port, mcpPath } = parseArgs();
+  const { transport, port, mcpPath, host } = parseArgs();
 
   if (transport === "stdio") {
     // One process, one client, one session — no session tracking needed.
@@ -457,7 +577,29 @@ export async function startServer(
   });
   store.startSweeper();
 
-  const httpServer = createServer(createMcpRequestHandler({ getServer, serverName, store, mcpPath }));
+  const authToken = process.env.MCP_AUTH_TOKEN?.trim() || undefined;
+  const allowedHosts = resolveAllowedHosts(host, process.env.MCP_ALLOWED_HOSTS);
+
+  if (!authToken && !isLoopbackHost(host)) {
+    console.error(
+      `WARNING: listening on ${host} with no MCP_AUTH_TOKEN set. Anyone who can reach ` +
+        `port ${port} can use every tool, including your Plex token and any configured ` +
+        `Sonarr/Radarr/Trakt credentials. Set MCP_AUTH_TOKEN, or keep the server behind ` +
+        `something that authenticates.`
+    );
+  }
+
+  const httpServer = createServer(
+    createMcpRequestHandler({
+      getServer,
+      serverName,
+      store,
+      mcpPath,
+      authToken,
+      allowedHosts,
+      maxStatelessInFlight: positiveIntFromEnv("MCP_MAX_SESSIONS", DEFAULT_MAX_SESSIONS),
+    })
+  );
 
   const shutdown = () => {
     store.closeAll();
@@ -466,7 +608,12 @@ export async function startServer(
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 
-  httpServer.listen(port, () => {
-    console.error(`${serverName} running on http://localhost:${port}${mcpPath}`);
+  httpServer.listen(port, host, () => {
+    const shown = host.includes(":") ? `[${host}]` : host;
+    console.error(`${serverName} running on http://${shown}:${port}${mcpPath}`);
+    console.error(
+      `  auth: ${authToken ? "bearer token required" : "none"}; ` +
+        `Host check: ${allowedHosts ? allowedHosts.join(", ") : "off"}`
+    );
   });
 }

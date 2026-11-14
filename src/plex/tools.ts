@@ -5,7 +5,7 @@
 
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { createWriteStream } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { PlexClient } from "./client.js";
 import { MCPResponse, LibraryMovieRecord, TasteProfile } from "./types.js";
@@ -26,7 +26,7 @@ import {
   SMART_PLAYLIST_LIBTYPE_IDS,
   PLEX_TAGGABLE_TYPE_IDS,
 } from "./constants.js";
-import { truncate, validatePlexId, sanitizeSearchQuery, validatePlexMediaContainer, validatePlexTotalSize } from "../shared/utils.js";
+import { truncate, validatePlexId, sanitizeSearchQuery, validatePlexMediaContainer, validatePlexTotalSize, posterUrlProblem } from "../shared/utils.js";
 import { formatToolPayload } from "../shared/output-format.js";
 
 /**
@@ -244,7 +244,7 @@ export class PlexTools {
   ): Promise<MCPResponse> {
     validatePlexId(libraryKey, "libraryKey");
 
-    const baseExportDir = path.resolve(process.cwd(), "exports");
+    const baseExportDir = path.resolve(process.env.PLEX_EXPORT_DIR?.trim() || path.join(process.cwd(), "exports"));
     let exportPath: string;
     if (outputPath) {
       if (path.isAbsolute(outputPath)) {
@@ -266,10 +266,26 @@ export class PlexTools {
 
     await mkdir(path.dirname(exportPath), { recursive: true });
 
+    // The string check above can't see symlinks: exports/link -> /etc would
+    // pass it. Compare real paths once the directories exist.
+    const [realBase, realParent] = await Promise.all([
+      realpath(baseExportDir),
+      realpath(path.dirname(exportPath)),
+    ]);
+    if (realParent !== realBase && !realParent.startsWith(`${realBase}${path.sep}`)) {
+      throw new McpError(ErrorCode.InvalidRequest, "outputPath must resolve inside the exports directory");
+    }
+
     const safePageSize =
       Number.isFinite(pageSize) && pageSize > 0 ? Math.floor(pageSize) : DEFAULT_LIMITS.exportPageSize;
-    const stream = createWriteStream(exportPath, { encoding: "utf8" });
+    // "wx": never replace an existing file. With O_EXCL this also refuses a
+    // symlink planted at the target name.
+    const stream = createWriteStream(exportPath, { encoding: "utf8", flags: "wx" });
     let streamError: Error | null = null;
+    let created = false;
+    stream.once("open", () => {
+      created = true;
+    });
     stream.once("error", (error) => {
       streamError = error as Error;
     });
@@ -280,6 +296,11 @@ export class PlexTools {
     let isFirst = true;
 
     try {
+      // Fail before paging through Plex if the file can't be created.
+      await new Promise<void>((resolve, reject) => {
+        stream.once("open", () => resolve());
+        stream.once("error", reject);
+      });
       await this.writeToStream(stream, "[\n");
 
       while (true) {
@@ -330,9 +351,18 @@ export class PlexTools {
       await this.finishStream(stream);
     } catch (error) {
       stream.destroy();
-      await rm(exportPath, { force: true }).catch(() => undefined);
+      // Only clean up a file this call created — never one that was already there.
+      if (created) {
+        await rm(exportPath, { force: true }).catch(() => undefined);
+      }
       if (error instanceof McpError) {
         throw error;
+      }
+      if ((streamError as NodeJS.ErrnoException | null)?.code === "EEXIST") {
+        throw new McpError(
+          ErrorCode.InvalidRequest,
+          `An export already exists at ${exportPath}; choose a different outputPath`
+        );
       }
       const message = this.getErrorMessage(streamError || error);
       throw new McpError(ErrorCode.InternalError, `Failed to export library: ${message}`);
@@ -941,6 +971,7 @@ export class PlexTools {
           "librarySectionId is required when smart=true; smart playlists filter a library section"
         );
       }
+      validatePlexId(librarySectionId, "librarySectionId");
 
       const resolvedLibtype = libtype ?? this.defaultLibtypeFor(playlistType);
       const libtypeId = SMART_PLAYLIST_LIBTYPE_IDS[resolvedLibtype];
@@ -964,6 +995,7 @@ export class PlexTools {
       }
       // python-plexapi comma-joins all rating keys in a single POST, seeding
       // the playlist fully without follow-up addToPlaylist calls.
+      ratingKeys.forEach((k) => validatePlexId(k, "ratingKey"));
       uri = `${uriRoot}/library/metadata/${ratingKeys.join(",")}`;
     }
 
@@ -1902,6 +1934,10 @@ export class PlexTools {
     if (!url) {
       return { success: false, error: "Poster update skipped: poster url is required" };
     }
+    const refused = posterUrlProblem(url);
+    if (refused) {
+      return { success: false, error: `Poster update skipped: ${refused}` };
+    }
 
     const attempts = [
       { endpoint: `/library/metadata/${ratingKey}/posters`, method: "POST", label: "POST /posters" },
@@ -2256,6 +2292,7 @@ export class PlexTools {
     qualityBias: number = 1.0,
     traktWatchedTitles?: Set<string>,
   ): Promise<MCPResponse> {
+    validatePlexId(libraryKey, "libraryKey");
     const allMovies = await this.client.getLibraryMoviesWithMeta(libraryKey, userId);
 
     // Merge Plex and Trakt watched data — Trakt catches off-Plex watches

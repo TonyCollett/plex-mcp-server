@@ -27,14 +27,14 @@ This MCP server transforms your Plex Media Server into an AI-queryable database.
 
 ## Features
 
-**55 tools** out of the box (67 with write operations enabled):
+**43 tools** out of the box (67 with write operations enabled):
 
 - **Plex Library Management** — Browse libraries, search media, get detailed metadata, list playlists and watchlist
 - **Tautulli-Style Analytics** — Viewing statistics, user activity, popular content, watch history
 - **Personalized Recommendations** — AI-powered movie suggestions based on your watch history, genres, directors, and actors. Supports per-user profiles for multi-user Plex servers.
 - **Sonarr/Radarr Integration** — Browse, search, add series/movies, view queues, trigger downloads
 - **Trakt.tv Sync** — OAuth authentication, watch history sync, enhanced statistics, scrobbling. When configured, Trakt data enriches recommendations by catching movies watched outside Plex.
-- **Write Operations** (opt-in) — Create/edit playlists, update metadata, manage watchlist, rate media, and mark media watched or unwatched
+- **Write Operations** (opt-in) — Create/edit playlists, update metadata, manage watchlist, rate media, mark media watched or unwatched, add series/movies and manage tags in Sonarr/Radarr, and write history to Trakt
 
 > **One server, all tools.** Trakt and Sonarr/Radarr credentials are optional — tools that need them return a helpful setup message if the key is missing. You don't need to configure everything upfront.
 
@@ -82,12 +82,32 @@ docker run -d --name plex-mcp \
   ghcr.io/niavasha/plex-mcp-server:latest
 ```
 
-The HTTP endpoint has no authentication of its own, and anyone who can reach
-it can call tools that use your Plex token. Keep it bound to `127.0.0.1` as
-above, or behind something that authenticates. Set `MCP_PORT` to listen on a
-different port, and `MCP_PATH` to serve MCP somewhere other than `/mcp` (for
-example `/plex/mcp` behind a reverse proxy). Outside Docker, the `--port` and
-`--path` flags do the same. The health check stays at `/health`.
+Anyone who can reach the HTTP endpoint can call tools that use your Plex
+token (and your Sonarr/Radarr/Trakt credentials, if set). To lock it down:
+
+- **`MCP_AUTH_TOKEN`** — when set, every MCP request must send
+  `Authorization: Bearer <token>`; anything else gets `401`. Generate one with
+  `openssl rand -hex 32`. The server logs a warning at startup if it listens
+  on a non-loopback address without one.
+- **`MCP_HOST`** — the address to listen on. Defaults to `127.0.0.1`; the
+  Docker image sets `0.0.0.0` so the published port works. Keep the published
+  port bound to `127.0.0.1` as above unless you also set a token.
+- **`MCP_ALLOWED_HOSTS`** — comma-separated hostnames the endpoint answers to
+  (matched against the `Host` header), e.g. `plex-mcp.example.com,localhost`.
+  When the server listens on loopback and this is unset, only `localhost`,
+  `127.0.0.1` and `[::1]` are accepted, which blocks DNS-rebinding attacks from
+  web pages.
+
+If your MCP client can't send custom headers, put the server behind a reverse
+proxy that authenticates, or use a long random `MCP_PATH` as a shared secret.
+
+Set `MCP_PORT` to listen on a different port, and `MCP_PATH` to serve MCP
+somewhere other than `/mcp` (for example `/plex/mcp` behind a reverse proxy).
+Outside Docker, the `--host`, `--port` and `--path` flags do the same. The
+health check stays at `/health` and needs no token.
+
+`export_library` writes to `/app/exports` in the container. Mount a volume
+there (`-v plex-mcp-exports:/app/exports`) to keep the files.
 
 For an MCP client that launches the server itself over stdio, override the
 command. `--no-healthcheck` turns off the image's HTTP health check, which a
@@ -138,6 +158,8 @@ The optional Trakt, Sonarr and Radarr variables from
 > **Sonarr/Radarr API keys** can be found at **Settings > General > API Key** in each app's web UI.
 
 > **Trakt.tv setup** requires a [Trakt OAuth application](https://trakt.tv/oauth/applications). Create one with redirect URI `urn:ietf:wg:oauth:2.0:oob`, then add the Client ID and Secret to your config. Once the server is running, ask your AI assistant to "authenticate with Trakt" — it will guide you through the OAuth flow. See the [Trakt setup guide](docs/trakt-setup-guide.md) for detailed instructions.
+
+> **Keeping the Trakt login:** set `TRAKT_TOKEN_FILE` to a writable path (e.g. `/app/exports/trakt-tokens.json` in Docker, on a mounted volume). Tokens from `trakt_complete_auth` and every later refresh are saved there with owner-only permissions and reused on restart. Without it, the tokens are written to the server log (stderr), never to the chat, and you copy them into `TRAKT_ACCESS_TOKEN`/`TRAKT_REFRESH_TOKEN` yourself. Trakt refresh tokens are single-use, so env-only tokens stop working after the first refresh once the server restarts.
 
 ### Compact Responses (optional)
 
@@ -240,7 +262,7 @@ Once configured, you can ask your AI assistant:
 
 ## Available Functions
 
-55 tools out of the box (67 with write operations enabled).
+43 tools out of the box (67 with write operations enabled). Tools marked **(write)** are only listed, and only run, with `PLEX_ENABLE_MUTATIVE_OPS=true`.
 
 ### Plex Tools (21 tools)
 
@@ -248,7 +270,7 @@ Once configured, you can ask your AI assistant:
 |----------|-------------|
 | `get_libraries` | List all Plex libraries |
 | `get_library_items` | List items in a library with pagination |
-| `export_library` | Export a full library to JSON (under `./exports`) |
+| `export_library` | Export a full library to JSON (under `./exports`, or `PLEX_EXPORT_DIR`); never overwrites an existing file |
 | `search_media` | Search media globally or within one library |
 | `get_recently_added` | Recently added content; pass `type` and `libraryKey` to list e.g. new episodes (TV is otherwise grouped by season) |
 | `get_on_deck` | Continue watching list |
@@ -270,7 +292,7 @@ Once configured, you can ask your AI assistant:
 
 ### Write Operations (12 tools, opt-in)
 
-Set `PLEX_ENABLE_MUTATIVE_OPS=true` to enable these tools. They allow your AI assistant to make changes to your Plex server. **Use with care** — while we test these tools, there are no guarantees. Review changes your assistant proposes before confirming.
+Set `PLEX_ENABLE_MUTATIVE_OPS=true` to enable these tools. The same switch enables the Sonarr, Radarr and Trakt tools marked **(write)** below. They allow your AI assistant to make changes to your Plex server. **Use with care** — while we test these tools, there are no guarantees. Review changes your assistant proposes before confirming.
 
 | Function | Description |
 |----------|-------------|
@@ -293,16 +315,16 @@ Set `PLEX_ENABLE_MUTATIVE_OPS=true` to enable these tools. They allow your AI as
 |----------|-------------|
 | `sonarr_get_series` | List series with optional title filter |
 | `sonarr_search` | Search TheTVDB for new series |
-| `sonarr_add_series` | Add series by TVDB ID, optionally with tags (created if missing) |
+| `sonarr_add_series` | **(write)** Add series by TVDB ID, optionally with tags (created if missing) |
 | `sonarr_get_missing` | Missing/wanted episodes |
 | `sonarr_get_queue` | Download queue |
 | `sonarr_get_calendar` | Upcoming episodes |
 | `sonarr_get_profiles` | Quality profiles and root folders |
-| `sonarr_trigger_search` | Trigger missing episode search |
+| `sonarr_trigger_search` | **(write)** Trigger missing episode search |
 | `sonarr_get_tags` | List tags with their IDs and labels |
-| `sonarr_create_tag` | Create a tag |
-| `sonarr_update_tag` | Rename a tag |
-| `sonarr_delete_tag` | Delete a tag |
+| `sonarr_create_tag` | **(write)** Create a tag |
+| `sonarr_update_tag` | **(write)** Rename a tag |
+| `sonarr_delete_tag` | **(write)** Delete a tag |
 
 ### Radarr Tools (12 tools)
 
@@ -310,16 +332,16 @@ Set `PLEX_ENABLE_MUTATIVE_OPS=true` to enable these tools. They allow your AI as
 |----------|-------------|
 | `radarr_get_movies` | List movies with optional title filter |
 | `radarr_search` | Search TMDB for new movies |
-| `radarr_add_movie` | Add movie by TMDB ID, optionally with tags (created if missing) |
+| `radarr_add_movie` | **(write)** Add movie by TMDB ID, optionally with tags (created if missing) |
 | `radarr_get_missing` | Missing/wanted movies |
 | `radarr_get_queue` | Download queue |
 | `radarr_get_calendar` | Upcoming movies |
 | `radarr_get_profiles` | Quality profiles and root folders |
-| `radarr_trigger_search` | Trigger missing movie search |
+| `radarr_trigger_search` | **(write)** Trigger missing movie search |
 | `radarr_get_tags` | List tags with their IDs and labels |
-| `radarr_create_tag` | Create a tag |
-| `radarr_update_tag` | Rename a tag |
-| `radarr_delete_tag` | Delete a tag |
+| `radarr_create_tag` | **(write)** Create a tag |
+| `radarr_update_tag` | **(write)** Rename a tag |
+| `radarr_delete_tag` | **(write)** Delete a tag |
 
 ### Cross-Service Tools (1 tool)
 
@@ -334,11 +356,11 @@ Set `PLEX_ENABLE_MUTATIVE_OPS=true` to enable these tools. They allow your AI as
 | `trakt_authenticate` | Start Trakt.tv OAuth flow |
 | `trakt_complete_auth` | Complete authentication |
 | `trakt_get_auth_status` | Check auth status |
-| `trakt_sync_to_trakt` | Sync Plex history to Trakt |
+| `trakt_sync_to_trakt` | **(write)** Sync Plex history to Trakt |
 | `trakt_sync_from_trakt` | Get Trakt data for comparison |
 | `trakt_get_user_stats` | Enhanced stats from Trakt |
 | `trakt_search` | Search Trakt database |
-| `trakt_start_scrobbling` | Real-time scrobbling |
+| `trakt_start_scrobbling` | **(write)** Real-time scrobbling |
 | `trakt_get_sync_status` | Check sync operation status |
 
 ## Getting Your Plex Token
