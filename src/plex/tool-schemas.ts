@@ -319,14 +319,34 @@ const UPDATE_METADATA_SCHEMA = {
       ratingKey: { type: "string", description: "The rating key of the media item to update" },
       title: { type: "string", description: "New title (optional)" },
       sortTitle: { type: "string", description: "New sort title (optional)" },
-      originalTitle: { type: "string", description: "New original title (optional)" },
+      originalTitle: {
+        type: "string",
+        description: "New original title (optional). For a music track this is the track artist",
+      },
       summary: { type: "string", description: "New summary/description (optional)" },
       year: { type: "number", description: "New year (optional)" },
       contentRating: { type: "string", description: "New content rating (optional)" },
       rating: { type: "number", description: "New user rating (optional)" },
       tagline: { type: "string", description: "New tagline (optional)" },
-      studio: { type: "string", description: "New studio (optional)" },
+      studio: { type: "string", description: "New studio (optional). For a music album this is the record label" },
+      originallyAvailableAt: {
+        type: "string",
+        description: "Release date as YYYY-MM-DD (optional), e.g. an album's release date",
+      },
+      trackNumber: { type: "number", description: "Track number, for a music track (optional)" },
+      discNumber: { type: "number", description: "Disc number, for a music track (optional)" },
       genres: { type: "array", description: "Replace genres with these tags (optional)", items: { type: "string" } },
+      styles: {
+        type: "array",
+        description: "Replace music styles with these tags (optional; artists and albums)",
+        items: { type: "string" },
+      },
+      moods: {
+        type: "array",
+        description: "Replace music moods with these tags (optional; artists, albums and tracks)",
+        items: { type: "string" },
+      },
+      labels: { type: "array", description: "Replace labels with these tags (optional)", items: { type: "string" } },
       collections: {
         type: "array",
         description: "Replace collections with these tags (optional)",
@@ -358,6 +378,86 @@ const UPDATE_METADATA_FROM_JSON_SCHEMA = {
       },
     },
     required: ["ratingKey", "metadata"],
+  },
+};
+
+const BULK_TAG_LISTS = {
+  type: "object",
+  properties: {
+    genres: { type: "array", items: { type: "string" } },
+    styles: { type: "array", items: { type: "string" } },
+    moods: { type: "array", items: { type: "string" } },
+    collections: { type: "array", items: { type: "string" } },
+    labels: { type: "array", items: { type: "string" } },
+  },
+  additionalProperties: false,
+};
+
+const BULK_UPDATE_METADATA_SCHEMA = {
+  name: "bulk_update_metadata",
+  description:
+    "Apply the same edits to many items at once, e.g. every track on an album or every album by an artist " +
+    "(requires PLEX_ENABLE_MUTATIVE_OPS=true). Pass ratingKeys, or parentRatingKey to edit all of an item's children. " +
+    "Items must share one type and library. Edited fields are locked against metadata refreshes. " +
+    "Tags are added or removed, leaving each item's other tags alone. Run with dryRun=true first to preview. " +
+    "To rename an album, edit the album itself with update_metadata; a track's album comes from its file tags and can't be changed here.",
+  inputSchema: {
+    type: "object" as const,
+    properties: {
+      ratingKeys: {
+        type: "array",
+        description: "Rating keys of the items to edit (at most 500)",
+        items: { type: "string" },
+      },
+      parentRatingKey: {
+        type: "string",
+        description: "Edit every child of this item instead: an album's tracks, an artist's albums, a season's episodes",
+      },
+      fields: {
+        type: "object",
+        description: "Fields to set on every item",
+        properties: {
+          originalTitle: { type: "string", description: "Track artist, for tracks; original title otherwise" },
+          summary: { type: "string" },
+          year: { type: "number" },
+          originallyAvailableAt: { type: "string", description: "Release date, YYYY-MM-DD" },
+          contentRating: { type: "string" },
+          tagline: { type: "string" },
+          studio: { type: "string", description: "Record label, for albums" },
+          discNumber: { type: "number", description: "Disc number, for tracks" },
+        },
+        additionalProperties: false,
+      },
+      addTags: { ...BULK_TAG_LISTS, description: "Tags to add to every item" },
+      removeTags: { ...BULK_TAG_LISTS, description: "Tags to remove from every item" },
+      dryRun: {
+        type: "boolean",
+        description: "List the items and their current values without changing anything",
+        default: false,
+      },
+    },
+  },
+};
+
+const MERGE_ITEMS_SCHEMA = {
+  name: "merge_items",
+  description:
+    "Merge duplicate movies, shows, artists or albums into one, like Merge in Plex Web " +
+    "(requires PLEX_ENABLE_MUTATIVE_OPS=true). The target keeps its metadata and gains the sources' media; " +
+    "the sources stop existing as separate items. All must be the same type in the same library. " +
+    "Returns a preview unless confirm=true. Split in Plex Web undoes a merge.",
+  inputSchema: {
+    type: "object" as const,
+    properties: {
+      targetRatingKey: { type: "string", description: "The item to keep" },
+      sourceRatingKeys: {
+        type: "array",
+        description: "Items to merge into the target (at most 50)",
+        items: { type: "string" },
+      },
+      confirm: { type: "boolean", description: "Set true to perform the merge", default: false },
+    },
+    required: ["targetRatingKey", "sourceRatingKeys"],
   },
 };
 
@@ -602,6 +702,8 @@ const PLEX_EXTENDED_TOOL_SCHEMAS = [
 export const PLEX_MUTATIVE_TOOL_SCHEMAS = [
   UPDATE_METADATA_SCHEMA,
   UPDATE_METADATA_FROM_JSON_SCHEMA,
+  BULK_UPDATE_METADATA_SCHEMA,
+  MERGE_ITEMS_SCHEMA,
   CREATE_PLAYLIST_SCHEMA,
   ADD_TO_PLAYLIST_SCHEMA,
   REMOVE_FROM_PLAYLIST_SCHEMA,

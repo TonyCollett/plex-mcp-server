@@ -31,10 +31,10 @@ describe("Unified server — tool registration", () => {
     expect(new Set(names).size).toBe(55);
   });
 
-  it("registers exactly 67 tools with mutative ops", () => {
+  it("registers exactly 69 tools with mutative ops", () => {
     const names = allSchemasWithMutative.map((s) => s.name);
-    expect(names).toHaveLength(67);
-    expect(new Set(names).size).toBe(67);
+    expect(names).toHaveLength(69);
+    expect(new Set(names).size).toBe(69);
   });
 
   it("includes plex core tools", () => {
