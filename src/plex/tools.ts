@@ -26,7 +26,7 @@ import {
   SMART_PLAYLIST_LIBTYPE_IDS,
   PLEX_TAGGABLE_TYPE_IDS,
 } from "./constants.js";
-import { truncate, validatePlexId, sanitizeSearchQuery, validatePlexMediaContainer, validatePlexTotalSize, posterUrlProblem } from "../shared/utils.js";
+import { chunkArray, truncate, validatePlexId, sanitizeSearchQuery, validatePlexMediaContainer, validatePlexTotalSize, posterUrlProblem } from "../shared/utils.js";
 import { formatToolPayload } from "../shared/output-format.js";
 
 /**
@@ -152,13 +152,96 @@ type MetadataUpdateInput = {
   rating?: number;
   tagline?: string;
   studio?: string;
+  originallyAvailableAt?: string;
+  trackNumber?: number;
+  discNumber?: number;
   genres?: unknown[];
   collections?: unknown[];
   roles?: unknown[];
   directors?: unknown[];
+  styles?: unknown[];
+  moods?: unknown[];
+  labels?: unknown[];
 };
 
-type EditableTagType = "genre" | "collection" | "role" | "director";
+type EditableTagType = "genre" | "collection" | "role" | "director" | "style" | "mood" | "label";
+
+/** Tool input key for each tag list, paired with the Plex tag name it edits. */
+const TAG_INPUTS = [
+  ["genres", "genre"],
+  ["collections", "collection"],
+  ["roles", "role"],
+  ["directors", "director"],
+  ["styles", "style"],
+  ["moods", "mood"],
+  ["labels", "label"],
+] as const satisfies ReadonlyArray<readonly [keyof MetadataUpdateInput, EditableTagType]>;
+
+/** The Metadata key Plex lists each tag type under (Genre, Style, ...). */
+const TAG_CONTAINER_KEYS: Record<EditableTagType, string> = {
+  genre: "Genre",
+  collection: "Collection",
+  role: "Role",
+  director: "Director",
+  style: "Style",
+  mood: "Mood",
+  label: "Label",
+};
+
+/** Tags a bulk edit may add or remove. Roles and directors are per-item credits, so they're left out. */
+const BULK_TAG_INPUTS = TAG_INPUTS.filter(([, tag]) => tag !== "role" && tag !== "director");
+
+/** Most items one bulk edit or merge touches, so one call can't rewrite a whole library. */
+export const MAX_BULK_EDIT_ITEMS = 500;
+export const MAX_MERGE_SOURCES = 50;
+/** Ids per Plex request, so query strings stay well under typical URL limits. */
+const BULK_REQUEST_CHUNK = 100;
+
+/** Plain fields a bulk edit may set: tool input key -> Plex field name. Titles and track numbers are per item. */
+const BULK_FIELD_INPUTS = {
+  originalTitle: "originalTitle",
+  summary: "summary",
+  year: "year",
+  originallyAvailableAt: "originallyAvailableAt",
+  contentRating: "contentRating",
+  tagline: "tagline",
+  studio: "studio",
+  discNumber: "parentIndex",
+} as const;
+
+export type BulkMetadataInput = {
+  ratingKeys?: string[];
+  parentRatingKey?: string;
+  fields?: Partial<Record<keyof typeof BULK_FIELD_INPUTS, string | number>>;
+  addTags?: Partial<Record<(typeof BULK_TAG_INPUTS)[number][0], unknown[]>>;
+  removeTags?: Partial<Record<(typeof BULK_TAG_INPUTS)[number][0], unknown[]>>;
+  dryRun?: boolean;
+};
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Turn the music-specific inputs into Plex field edits, or explain why one is invalid. */
+function musicFieldParams(
+  input: { originallyAvailableAt?: unknown; trackNumber?: unknown; discNumber?: unknown },
+  params: Record<string, string | number>
+): void {
+  if (input.originallyAvailableAt !== undefined) {
+    const date = String(input.originallyAvailableAt).trim();
+    if (!DATE_RE.test(date) || Number.isNaN(Date.parse(date))) {
+      throw new McpError(ErrorCode.InvalidRequest, "originallyAvailableAt must be a date in YYYY-MM-DD form");
+    }
+    params.originallyAvailableAt = date;
+  }
+  for (const [key, field] of [["trackNumber", "index"], ["discNumber", "parentIndex"]] as const) {
+    const value = input[key];
+    if (value === undefined) continue;
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < 0) {
+      throw new McpError(ErrorCode.InvalidRequest, `${key} must be a whole number of 0 or more`);
+    }
+    params[field] = n;
+  }
+}
 
 export class PlexTools {
   private machineIdentifier?: string;
@@ -551,11 +634,19 @@ export class PlexTools {
       throw new McpError(ErrorCode.InvalidRequest, `Media item not found: ${ratingKey}`);
     }
 
-    const availableTags = {
-      genres: (item.Genre as Array<{ tag: string }> | undefined)?.map((g) => g.tag) || [],
-      collections: (item.Collection as Array<{ tag: string }> | undefined)?.map((c) => c.tag) || [],
-      roles: (item.Role as Array<{ tag: string }> | undefined)?.map((r) => r.tag) || [],
-      directors: (item.Director as Array<{ tag: string }> | undefined)?.map((d) => d.tag) || [],
+    const isMusic = item.type === "artist" || item.type === "album" || item.type === "track";
+    const availableTags: Record<string, string[]> = {
+      genres: this.getCurrentTags(item, "genre"),
+      collections: this.getCurrentTags(item, "collection"),
+      roles: this.getCurrentTags(item, "role"),
+      directors: this.getCurrentTags(item, "director"),
+      ...(isMusic
+        ? {
+            styles: this.getCurrentTags(item, "style"),
+            moods: this.getCurrentTags(item, "mood"),
+            labels: this.getCurrentTags(item, "label"),
+          }
+        : {}),
     };
 
     const editableFields = [
@@ -568,11 +659,11 @@ export class PlexTools {
       "rating",
       "tagline",
       "studio",
+      ...(item.type === "album" ? ["originallyAvailableAt"] : []),
+      ...(item.type === "track" ? ["trackNumber", "discNumber"] : []),
     ];
 
-    const editableTags = Object.keys(availableTags).filter(
-      (key) => availableTags[key as keyof typeof availableTags].length > 0
-    );
+    const editableTags = Object.keys(availableTags).filter((key) => availableTags[key].length > 0);
 
     // Plex lists a field in `Field` only while it is locked against metadata refreshes.
     const lockedFields = (
@@ -592,6 +683,9 @@ export class PlexTools {
       lockedFields,
       notes: [
         "Roles/directors availability depends on agent/library type.",
+        ...(item.type === "track"
+          ? ["For a track, originalTitle is the track artist. Which album a track is on comes from the file's tags and can't be edited here."]
+          : []),
         "If a tag array is empty, Plex likely won't accept edits for that tag type.",
         "lockedFields uses Plex's own field names (e.g. genre, collection) and lists only fields locked against metadata refreshes.",
       ],
@@ -762,20 +856,12 @@ export class PlexTools {
     if (input.contentRating !== undefined) params.contentRating = input.contentRating;
     if (input.tagline !== undefined) params.tagline = input.tagline;
     if (input.studio !== undefined) params.studio = input.studio;
+    // Music: release date, and track/disc numbers (Plex's index/parentIndex).
+    musicFieldParams(input, params);
     const ratingRequested = input.rating !== undefined;
 
-    const tagInputs = {
-      genres: this.normalizeTagList(input.genres),
-      collections: this.normalizeTagList(input.collections),
-      roles: this.normalizeTagList(input.roles),
-      directors: this.normalizeTagList(input.directors),
-    };
-
-    const hasTagUpdates =
-      input.genres !== undefined ||
-      input.collections !== undefined ||
-      input.roles !== undefined ||
-      input.directors !== undefined;
+    const requestedTags = TAG_INPUTS.filter(([key]) => input[key] !== undefined);
+    const hasTagUpdates = requestedTags.length > 0;
 
     if (Object.keys(params).length === 0 && !hasTagUpdates && !ratingRequested) {
       throw new McpError(
@@ -812,27 +898,14 @@ export class PlexTools {
     }
 
     const tagResults: Array<Record<string, unknown>> = [];
-    if (hasTagUpdates) {
-      if (input.genres !== undefined) {
-        const result = await this.replaceTagsSafely(input.ratingKey, "genre", tagInputs.genres);
-        if (result.success) anySuccess = true;
-        tagResults.push(result);
-      }
-      if (input.collections !== undefined) {
-        const result = await this.replaceTagsSafely(input.ratingKey, "collection", tagInputs.collections);
-        if (result.success) anySuccess = true;
-        tagResults.push(result);
-      }
-      if (input.roles !== undefined) {
-        const result = await this.replaceTagsSafely(input.ratingKey, "role", tagInputs.roles);
-        if (result.success) anySuccess = true;
-        tagResults.push(result);
-      }
-      if (input.directors !== undefined) {
-        const result = await this.replaceTagsSafely(input.ratingKey, "director", tagInputs.directors);
-        if (result.success) anySuccess = true;
-        tagResults.push(result);
-      }
+    for (const [key, tag] of requestedTags) {
+      const result = await this.replaceTagsSafely(
+        input.ratingKey,
+        tag,
+        this.normalizeTagList(input[key] as unknown[] | undefined)
+      );
+      if (result.success) anySuccess = true;
+      tagResults.push(result);
     }
 
     return jsonResponse({
@@ -872,10 +945,13 @@ export class PlexTools {
     if ("rating" in metadata && metadata.rating !== null && metadata.rating !== undefined) mapped.rating = metadata.rating as number;
     if ("tagline" in metadata) mapped.tagline = normalizeNullable(metadata.tagline) as string | undefined;
     if ("studio" in metadata) mapped.studio = normalizeNullable(metadata.studio) as string | undefined;
-    if ("genres" in metadata) mapped.genres = metadata.genres as unknown[];
-    if ("collections" in metadata) mapped.collections = metadata.collections as unknown[];
-    if ("roles" in metadata) mapped.roles = metadata.roles as unknown[];
-    if ("directors" in metadata) mapped.directors = metadata.directors as unknown[];
+    for (const key of ["originallyAvailableAt", "trackNumber", "discNumber"] as const) {
+      const value = normalizeNullable(metadata[key]);
+      if (value !== undefined) (mapped as Record<string, unknown>)[key] = value;
+    }
+    for (const [key] of TAG_INPUTS) {
+      if (key in metadata) mapped[key] = metadata[key] as unknown[];
+    }
 
     const warnings: string[] = [];
     let metadataUpdated = false;
@@ -929,6 +1005,227 @@ export class PlexTools {
       ),
       ignoredFields,
       warnings: warnings.length > 0 ? warnings : undefined,
+    });
+  }
+
+  /**
+   * Apply one set of edits to many items at once: a list of rating keys, or every
+   * child of a parent (an album's tracks, an artist's albums, a season's episodes).
+   * Uses the same multi-item edit Plex Web sends when you select several items and
+   * click Edit, so it is one request per 100 items. Edited fields are locked so a
+   * metadata refresh doesn't undo them. Each item is re-read afterwards and any
+   * edit Plex didn't save is reported, since Plex answers 200 even when it ignores one.
+   */
+  async bulkUpdateMetadata(input: BulkMetadataInput): Promise<MCPResponse> {
+    this.requireMutativeOpsEnabled("bulk_update_metadata");
+
+    const keysGiven = Array.isArray(input.ratingKeys) && input.ratingKeys.length > 0;
+    const parentGiven = typeof input.parentRatingKey === "string" && input.parentRatingKey !== "";
+    if (keysGiven === parentGiven) {
+      throw new McpError(ErrorCode.InvalidRequest, "Pass either ratingKeys or parentRatingKey (not both)");
+    }
+
+    const fields = this.parseBulkFields(input.fields);
+    const adds = this.parseBulkTags(input.addTags, "addTags");
+    const removes = this.parseBulkTags(input.removeTags, "removeTags");
+    if (Object.keys(fields).length === 0 && adds.length === 0 && removes.length === 0) {
+      throw new McpError(ErrorCode.InvalidRequest, "Nothing to change: pass fields, addTags or removeTags");
+    }
+    for (const add of adds) {
+      const removal = removes.find((r) => r.tag === add.tag);
+      const both = removal ? add.values.filter((v) => removal.values.includes(v)) : [];
+      if (both.length > 0) {
+        throw new McpError(ErrorCode.InvalidRequest, `Can't both add and remove ${add.tag} "${both[0]}"`);
+      }
+    }
+
+    let ratingKeys: string[];
+    if (parentGiven) {
+      ratingKeys = await this.childRatingKeys(input.parentRatingKey as string, MAX_BULK_EDIT_ITEMS);
+      if (ratingKeys.length === 0) {
+        throw new McpError(ErrorCode.InvalidRequest, `Item ${input.parentRatingKey} has no children to edit`);
+      }
+    } else {
+      ratingKeys = [...new Set((input.ratingKeys as unknown[]).map((key) => String(key).trim()))];
+      ratingKeys.forEach((key) => validatePlexId(key, "ratingKeys"));
+    }
+    if (ratingKeys.length > MAX_BULK_EDIT_ITEMS) {
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `A bulk edit can touch at most ${MAX_BULK_EDIT_ITEMS} items; this one would touch more`
+      );
+    }
+
+    const before = await this.fetchItemsByKey(ratingKeys);
+    const { type, libraryKey } = this.requireOneTypeAndLibrary(ratingKeys, before);
+    const typeId = this.getTaggableTypeId(type);
+
+    const touchedFields = Object.keys(fields);
+    const describe = (item: Record<string, unknown>) => ({
+      ratingKey: String(item.ratingKey),
+      title: item.title,
+      current: Object.fromEntries(touchedFields.map((field) => [field, item[field]])),
+      currentTags:
+        adds.length + removes.length > 0
+          ? Object.fromEntries(
+              [...new Set([...adds, ...removes].map((edit) => edit.tag))].map((tag) => [
+                tag,
+                this.getCurrentTags(item, tag),
+              ])
+            )
+          : undefined,
+    });
+    const summary = {
+      itemCount: ratingKeys.length,
+      type,
+      librarySectionID: libraryKey,
+      fields: touchedFields.length > 0 ? fields : undefined,
+      addTags: adds.length > 0 ? Object.fromEntries(adds.map((a) => [a.tag, a.values])) : undefined,
+      removeTags: removes.length > 0 ? Object.fromEntries(removes.map((r) => [r.tag, r.values])) : undefined,
+    };
+
+    if (input.dryRun) {
+      return jsonResponse({
+        dryRun: true,
+        ...summary,
+        items: ratingKeys.map((key) => describe(before.get(key) as Record<string, unknown>)),
+        message: "Nothing was changed. Run again without dryRun to apply these edits.",
+      });
+    }
+
+    const warnings: string[] = [];
+    for (const chunk of chunkArray(ratingKeys, BULK_REQUEST_CHUNK)) {
+      const base = { type: typeId, id: chunk.join(",") };
+      // Fields and additions first, removals second, so a failed removal never loses data.
+      const firstPass: Record<string, string | number> = { ...base };
+      for (const [field, value] of Object.entries(fields)) {
+        firstPass[`${field}.value`] = value;
+        firstPass[`${field}.locked`] = 1;
+      }
+      for (const add of adds) Object.assign(firstPass, this.buildTagParams(add.tag, add.values, true, false));
+      if (Object.keys(firstPass).length > 2) {
+        try {
+          await this.client.makeRequest(`/library/sections/${libraryKey}/all`, firstPass, "PUT");
+        } catch (error) {
+          warnings.push(`Edit failed for items ${chunk[0]}..${chunk[chunk.length - 1]}: ${this.getErrorMessage(error)}`);
+          continue;
+        }
+      }
+      for (const removal of removes) {
+        try {
+          await this.client.makeRequest(
+            `/library/sections/${libraryKey}/all`,
+            { ...base, ...this.buildTagParams(removal.tag, removal.values, true, true) },
+            "PUT"
+          );
+        } catch (error) {
+          warnings.push(`Removing ${removal.tag} tags failed for items ${chunk[0]}..${chunk[chunk.length - 1]}: ${this.getErrorMessage(error)}`);
+        }
+      }
+    }
+
+    const after = await this.fetchItemsByKey(ratingKeys);
+    const failed: Array<{ ratingKey: string; title: unknown; problems: string[] }> = [];
+    for (const key of ratingKeys) {
+      const item = after.get(key);
+      if (!item) {
+        failed.push({ ratingKey: key, title: before.get(key)?.title, problems: ["no longer found after the edit"] });
+        continue;
+      }
+      const problems: string[] = [];
+      for (const [field, value] of Object.entries(fields)) {
+        const now = String(item[field] ?? "").trim();
+        if (now !== String(value).trim()) problems.push(`${field} still reads "${now}"`);
+      }
+      const tagsNow = new Map<EditableTagType, string[]>();
+      const tagsOf = (tag: EditableTagType) => {
+        if (!tagsNow.has(tag)) tagsNow.set(tag, this.getCurrentTags(item, tag));
+        return tagsNow.get(tag) as string[];
+      };
+      for (const add of adds) {
+        const missing = add.values.filter((v) => !tagsOf(add.tag).includes(v));
+        if (missing.length > 0) problems.push(`${add.tag} missing: ${missing.join(", ")}`);
+      }
+      for (const removal of removes) {
+        const left = removal.values.filter((v) => tagsOf(removal.tag).includes(v));
+        if (left.length > 0) problems.push(`${removal.tag} still has: ${left.join(", ")}`);
+      }
+      if (problems.length > 0) failed.push({ ratingKey: key, title: item.title, problems });
+    }
+
+    return jsonResponse({
+      updated: ratingKeys.length - failed.length,
+      ...summary,
+      failed: failed.length > 0 ? failed : undefined,
+      warnings: warnings.length > 0 ? warnings : undefined,
+    });
+  }
+
+  /**
+   * Merge duplicate items into one, the way Plex Web's Merge does: the target keeps
+   * its metadata and gains the sources' media files, and the sources disappear.
+   * Works for movies, shows, artists and albums in the same library. Previews unless
+   * confirm is true. Plex Web's Split on the merged item undoes it.
+   */
+  async mergeItems(targetRatingKey: string, sourceRatingKeys: string[], confirm: boolean = false): Promise<MCPResponse> {
+    this.requireMutativeOpsEnabled("merge_items");
+    validatePlexId(targetRatingKey, "targetRatingKey");
+    if (!Array.isArray(sourceRatingKeys) || sourceRatingKeys.length === 0) {
+      throw new McpError(ErrorCode.InvalidRequest, "sourceRatingKeys must list at least one item to merge in");
+    }
+    const sources = [...new Set(sourceRatingKeys.map((key) => String(key).trim()))];
+    sources.forEach((key) => validatePlexId(key, "sourceRatingKeys"));
+    if (sources.includes(targetRatingKey)) {
+      throw new McpError(ErrorCode.InvalidRequest, "The target can't also be one of the sources");
+    }
+    if (sources.length > MAX_MERGE_SOURCES) {
+      throw new McpError(ErrorCode.InvalidRequest, `At most ${MAX_MERGE_SOURCES} items can be merged in one call`);
+    }
+
+    const allKeys = [targetRatingKey, ...sources];
+    const items = await this.fetchItemsByKey(allKeys);
+    const { type } = this.requireOneTypeAndLibrary(allKeys, items);
+    if (!["movie", "show", "artist", "album"].includes(type)) {
+      throw new McpError(ErrorCode.InvalidRequest, `Plex can merge movies, shows, artists and albums, not ${type}s`);
+    }
+
+    const describe = (key: string) => {
+      const item = items.get(key) as Record<string, unknown>;
+      return {
+        ratingKey: key,
+        title: item.title,
+        parentTitle: item.parentTitle,
+        year: item.year,
+        childCount: item.leafCount ?? item.childCount,
+      };
+    };
+
+    if (!confirm) {
+      return jsonResponse({
+        preview: true,
+        confirmationRequired: true,
+        type,
+        target: describe(targetRatingKey),
+        sources: sources.map(describe),
+        message:
+          "Set confirm=true to merge. The target keeps its metadata and gains the sources' files; " +
+          "the sources stop existing as separate items. Split in Plex Web undoes a merge.",
+      });
+    }
+
+    await this.client.makeRequest(`/library/metadata/${targetRatingKey}/merge`, { ids: sources.join(",") }, "PUT");
+
+    const remaining = await this.fetchItemsByKey(sources);
+    const stillListed = sources.filter((key) => remaining.has(key));
+    return jsonResponse({
+      merged: stillListed.length === 0,
+      type,
+      target: describe(targetRatingKey),
+      mergedSources: sources.filter((key) => !remaining.has(key)),
+      warnings:
+        stillListed.length > 0
+          ? [`Plex still lists ${stillListed.join(", ")} as separate items; check them in Plex Web`]
+          : undefined,
     });
   }
 
@@ -1853,18 +2150,7 @@ export class PlexTools {
   }
 
   private getCurrentTags(item: Record<string, unknown>, tag: EditableTagType): string[] {
-    const list = (() => {
-      switch (tag) {
-        case "genre":
-          return item.Genre as Array<{ tag: string }> | undefined;
-        case "collection":
-          return item.Collection as Array<{ tag: string }> | undefined;
-        case "director":
-          return item.Director as Array<{ tag: string }> | undefined;
-        case "role":
-          return item.Role as Array<{ tag: string }> | undefined;
-      }
-    })();
+    const list = item[TAG_CONTAINER_KEYS[tag]] as Array<{ tag: string }> | undefined;
     return (Array.isArray(list) ? list : []).map((entry) => entry.tag).filter(Boolean);
   }
 
@@ -1921,10 +2207,7 @@ export class PlexTools {
       throw new McpError(ErrorCode.InvalidRequest, `Media item not found: ${ratingKey}`);
     }
 
-    const libraryKey =
-      (item.librarySectionID as string | number | undefined) ||
-      (item.librarySectionKey as string | number | undefined) ||
-      ((item.librarySection as { key?: string | number } | undefined)?.key as string | number | undefined);
+    const libraryKey = this.libraryKeyOf(item);
     if (!libraryKey) {
       throw new McpError(
         ErrorCode.InternalError,
@@ -1932,7 +2215,135 @@ export class PlexTools {
       );
     }
 
-    return { item, libraryKey: String(libraryKey) };
+    return { item, libraryKey };
+  }
+
+  private libraryKeyOf(item: Record<string, unknown>): string | undefined {
+    const key =
+      (item.librarySectionID as string | number | undefined) ||
+      (item.librarySectionKey as string | number | undefined) ||
+      ((item.librarySection as { key?: string | number } | undefined)?.key as string | number | undefined);
+    return key ? String(key) : undefined;
+  }
+
+  /** Fetch many items in one request per 100 (GET /library/metadata/1,2,3), keyed by rating key. */
+  private async fetchItemsByKey(ratingKeys: string[]): Promise<Map<string, Record<string, unknown>>> {
+    const found = new Map<string, Record<string, unknown>>();
+    for (const chunk of chunkArray(ratingKeys, BULK_REQUEST_CHUNK)) {
+      chunk.forEach((key) => validatePlexId(key, "ratingKey"));
+      let data: Record<string, unknown>;
+      try {
+        data = await this.client.makeRequest(`/library/metadata/${chunk.join(",")}`);
+      } catch (error) {
+        // Plex answers 404 when none of the ids exist; that just means nothing was found.
+        if ((error as { response?: { status?: number } }).response?.status === 404) continue;
+        throw error;
+      }
+      const items = (data as { MediaContainer?: { Metadata?: Array<Record<string, unknown>> } }).MediaContainer?.Metadata ?? [];
+      for (const item of items) found.set(String(item.ratingKey), item);
+    }
+    return found;
+  }
+
+  /** Every item must exist and share one type and one library: Plex's multi-item endpoints take one of each. */
+  private requireOneTypeAndLibrary(
+    ratingKeys: string[],
+    items: Map<string, Record<string, unknown>>
+  ): { type: string; libraryKey: string } {
+    const missing = ratingKeys.filter((key) => !items.has(key));
+    if (missing.length > 0) {
+      throw new McpError(ErrorCode.InvalidRequest, `Media items not found: ${missing.join(", ")}`);
+    }
+    const types = new Set(ratingKeys.map((key) => String(items.get(key)?.type)));
+    if (types.size > 1) {
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `All items must be the same type; these are a mix of ${[...types].join(", ")}`
+      );
+    }
+    const libraries = new Set(ratingKeys.map((key) => this.libraryKeyOf(items.get(key) as Record<string, unknown>)));
+    if (libraries.size > 1) {
+      throw new McpError(ErrorCode.InvalidRequest, "All items must be in the same library");
+    }
+    const [libraryKey] = libraries;
+    if (!libraryKey) {
+      throw new McpError(ErrorCode.InternalError, "Unable to determine the library section for these items");
+    }
+    validatePlexId(libraryKey, "libraryKey");
+    return { type: [...types][0], libraryKey };
+  }
+
+  /** Rating keys of an item's children, paged, stopping once there are more than `max`. */
+  private async childRatingKeys(parentRatingKey: string, max: number): Promise<string[]> {
+    validatePlexId(parentRatingKey, "parentRatingKey");
+    const keys: string[] = [];
+    const pageSize = 200;
+    for (let start = 0; keys.length <= max; start += pageSize) {
+      const data = await this.client.makeRequest(`/library/metadata/${parentRatingKey}/children`, {
+        "X-Plex-Container-Start": start,
+        "X-Plex-Container-Size": pageSize,
+      });
+      const mc = (data as { MediaContainer?: Record<string, unknown> }).MediaContainer ?? {};
+      const page = (mc.Metadata as Array<Record<string, unknown>> | undefined) ?? [];
+      for (const item of page) {
+        if (item.ratingKey !== undefined) keys.push(String(item.ratingKey));
+      }
+      const total = (mc.totalSize as number | undefined) ?? (mc.size as number | undefined);
+      if (page.length < pageSize || (total !== undefined && start + page.length >= total)) break;
+    }
+    return keys;
+  }
+
+  private parseBulkFields(raw: unknown): Record<string, string | number> {
+    const fields: Record<string, string | number> = {};
+    if (raw === undefined || raw === null) return fields;
+    if (typeof raw !== "object" || Array.isArray(raw)) {
+      throw new McpError(ErrorCode.InvalidRequest, "fields must be an object");
+    }
+    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (!Object.hasOwn(BULK_FIELD_INPUTS, key)) {
+        throw new McpError(
+          ErrorCode.InvalidRequest,
+          `fields.${key} can't be set in bulk. Allowed: ${Object.keys(BULK_FIELD_INPUTS).join(", ")}`
+        );
+      }
+      if (value === undefined || value === null) continue;
+      if (key === "originallyAvailableAt" || key === "discNumber") {
+        musicFieldParams({ [key]: value }, fields);
+      } else if (key === "year") {
+        const year = Number(value);
+        if (!Number.isInteger(year) || year < 0) {
+          throw new McpError(ErrorCode.InvalidRequest, "fields.year must be a whole number");
+        }
+        fields.year = year;
+      } else {
+        fields[BULK_FIELD_INPUTS[key as keyof typeof BULK_FIELD_INPUTS]] = String(value);
+      }
+    }
+    return fields;
+  }
+
+  private parseBulkTags(raw: unknown, name: string): Array<{ tag: EditableTagType; values: string[] }> {
+    if (raw === undefined || raw === null) return [];
+    if (typeof raw !== "object" || Array.isArray(raw)) {
+      throw new McpError(ErrorCode.InvalidRequest, `${name} must be an object such as { "genres": ["Jazz"] }`);
+    }
+    const edits: Array<{ tag: EditableTagType; values: string[] }> = [];
+    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+      const match = BULK_TAG_INPUTS.find(([input]) => input === key);
+      if (!match) {
+        throw new McpError(
+          ErrorCode.InvalidRequest,
+          `${name}.${key} isn't supported. Allowed: ${BULK_TAG_INPUTS.map(([input]) => input).join(", ")}`
+        );
+      }
+      if (value !== undefined && value !== null && !Array.isArray(value)) {
+        throw new McpError(ErrorCode.InvalidRequest, `${name}.${key} must be a list of tags`);
+      }
+      const values = [...new Set(this.normalizeTagList(value as unknown[] | undefined))];
+      if (values.length > 0) edits.push({ tag: match[1], values });
+    }
+    return edits;
   }
 
   private async getPlexGuid(ratingKey: string): Promise<string> {

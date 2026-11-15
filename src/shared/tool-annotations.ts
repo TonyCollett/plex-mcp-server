@@ -32,6 +32,7 @@ import { PLEX_MUTATIVE_TOOL_SCHEMAS } from "../plex/tool-schemas.js";
 const DESTRUCTIVE_TOOLS = new Set<string>([
   "delete_playlist",
   "clear_playlist",
+  "merge_items",
   "sonarr_delete_tag",
   "radarr_delete_tag",
 ]);

@@ -3,7 +3,7 @@
  */
 
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
-import { PlexTools } from "./tools.js";
+import { PlexTools, type BulkMetadataInput } from "./tools.js";
 import { MCPResponse } from "./types.js";
 import { DEFAULT_LIMITS, isMutativeOpsEnabled, PLEX_MUTATIVE_OPS_ENV_VAR } from "./constants.js";
 
@@ -254,11 +254,36 @@ export function createPlexToolRegistry(tools: PlexTools, options: ToolRegistryOp
       rating: args.rating as number | undefined,
       tagline: args.tagline as string | undefined,
       studio: args.studio as string | undefined,
+      originallyAvailableAt: args.originallyAvailableAt as string | undefined,
+      trackNumber: args.trackNumber as number | undefined,
+      discNumber: args.discNumber as number | undefined,
       genres: args.genres as unknown[] | undefined,
       collections: args.collections as unknown[] | undefined,
       roles: args.roles as unknown[] | undefined,
       directors: args.directors as unknown[] | undefined,
+      styles: args.styles as unknown[] | undefined,
+      moods: args.moods as unknown[] | undefined,
+      labels: args.labels as unknown[] | undefined,
     })
+  ));
+
+  registry.register("bulk_update_metadata", guardMutativeOp((args) =>
+    tools.bulkUpdateMetadata({
+      ratingKeys: args.ratingKeys as string[] | undefined,
+      parentRatingKey: args.parentRatingKey as string | undefined,
+      fields: args.fields as BulkMetadataInput["fields"],
+      addTags: args.addTags as BulkMetadataInput["addTags"],
+      removeTags: args.removeTags as BulkMetadataInput["removeTags"],
+      dryRun: args.dryRun as boolean | undefined,
+    })
+  ));
+
+  registry.register("merge_items", guardMutativeOp((args) =>
+    tools.mergeItems(
+      args.targetRatingKey as string,
+      args.sourceRatingKeys as string[],
+      (args.confirm as boolean) || false
+    )
   ));
 
   registry.register("update_metadata_from_json", guardMutativeOp((args) =>
