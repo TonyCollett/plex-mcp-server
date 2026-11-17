@@ -286,6 +286,17 @@ export function createPlexToolRegistry(tools: PlexTools, options: ToolRegistryOp
     )
   ));
 
+  registry.register("scan_library", guardMutativeOp((args) =>
+    tools.scanLibrary(args.libraryId as string, {
+      path: args.path as string | undefined,
+      force: args.force as boolean | undefined,
+    })
+  ));
+
+  registry.register("empty_trash", guardMutativeOp((args) =>
+    tools.emptyTrash(args.libraryId as string, (args.confirm as boolean) || false)
+  ));
+
   registry.register("update_metadata_from_json", guardMutativeOp((args) =>
     tools.updateMetadataFromJson(
       args.ratingKey as string,

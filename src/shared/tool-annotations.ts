@@ -33,6 +33,7 @@ const DESTRUCTIVE_TOOLS = new Set<string>([
   "delete_playlist",
   "clear_playlist",
   "merge_items",
+  "empty_trash",
   "sonarr_delete_tag",
   "radarr_delete_tag",
 ]);

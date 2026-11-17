@@ -461,6 +461,47 @@ const MERGE_ITEMS_SCHEMA = {
   },
 };
 
+const SCAN_LIBRARY_SCHEMA = {
+  name: "scan_library",
+  description:
+    "Scan a library for new, changed and missing files, like Scan Library Files in Plex Web " +
+    "(requires PLEX_ENABLE_MUTATIVE_OPS=true). Pass path to scan one folder inside the library, " +
+    "or force=true to refresh all metadata instead (locked fields are kept). " +
+    "Plex scans in the background and the call returns at once.",
+  inputSchema: {
+    type: "object" as const,
+    properties: {
+      libraryId: { type: "string", description: "Library key, from get_libraries" },
+      path: {
+        type: "string",
+        description: "Only scan this folder. Must be inside one of the library's folders, as Plex sees them",
+      },
+      force: {
+        type: "boolean",
+        description: "Refresh all metadata for the whole library instead of scanning files. Slow on large libraries",
+        default: false,
+      },
+    },
+    required: ["libraryId"],
+  },
+};
+
+const EMPTY_TRASH_SCHEMA = {
+  name: "empty_trash",
+  description:
+    "Empty a library's trash, like Empty Trash in Plex Web (requires PLEX_ENABLE_MUTATIVE_OPS=true). " +
+    "Items whose files are missing are removed for good, with their watch history and ratings; Plex can't undo it. " +
+    "If a drive holding the library is offline its items count as missing too. Returns a preview unless confirm=true.",
+  inputSchema: {
+    type: "object" as const,
+    properties: {
+      libraryId: { type: "string", description: "Library key, from get_libraries" },
+      confirm: { type: "boolean", description: "Set true to empty the trash", default: false },
+    },
+    required: ["libraryId"],
+  },
+};
+
 const CREATE_PLAYLIST_SCHEMA = {
   name: "create_playlist",
   description:
@@ -698,12 +739,14 @@ const PLEX_EXTENDED_TOOL_SCHEMAS = [
 ];
 
 /** All Plex tool schemas */
-/** Mutative tools (12 tools) — registered only when opt-in is enabled */
+/** Mutative tools (16 tools) — registered only when opt-in is enabled */
 export const PLEX_MUTATIVE_TOOL_SCHEMAS = [
   UPDATE_METADATA_SCHEMA,
   UPDATE_METADATA_FROM_JSON_SCHEMA,
   BULK_UPDATE_METADATA_SCHEMA,
   MERGE_ITEMS_SCHEMA,
+  SCAN_LIBRARY_SCHEMA,
+  EMPTY_TRASH_SCHEMA,
   CREATE_PLAYLIST_SCHEMA,
   ADD_TO_PLAYLIST_SCHEMA,
   REMOVE_FROM_PLAYLIST_SCHEMA,
