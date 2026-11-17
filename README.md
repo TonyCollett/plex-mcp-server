@@ -27,7 +27,7 @@ This MCP server transforms your Plex Media Server into an AI-queryable database.
 
 ## Features
 
-**41 tools** out of the box (69 with write operations enabled):
+**41 tools** out of the box (71 with write operations enabled):
 
 - **Plex Library Management** — Browse libraries, search media, get detailed metadata, list playlists and watchlist
 - **Tautulli-Style Analytics** — Viewing statistics, user activity, popular content, watch history
@@ -270,7 +270,7 @@ Once configured, you can ask your AI assistant:
 
 ## Available Functions
 
-41 tools out of the box (69 with write operations enabled). Tools marked **(write)** are only listed, and only run, with `PLEX_ENABLE_MUTATIVE_OPS=true`.
+41 tools out of the box (71 with write operations enabled). Tools marked **(write)** are only listed, and only run, with `PLEX_ENABLE_MUTATIVE_OPS=true`.
 
 ### Plex Tools (21 tools)
 
@@ -298,7 +298,7 @@ Once configured, you can ask your AI assistant:
 | `get_recommendations` | Personalized movie recommendations based on your watch history |
 | `get_active_sessions` | Currently active Plex streams — who is watching what, player state, transcoding |
 
-### Write Operations (14 tools, opt-in)
+### Write Operations (16 tools, opt-in)
 
 Set `PLEX_ENABLE_MUTATIVE_OPS=true` to enable these tools. The same switch enables the Sonarr, Radarr and Trakt tools marked **(write)** below. They allow your AI assistant to make changes to your Plex server. **Use with care** — while we test these tools, there are no guarantees. Review changes your assistant proposes before confirming.
 
@@ -308,6 +308,8 @@ Set `PLEX_ENABLE_MUTATIVE_OPS=true` to enable these tools. The same switch enabl
 | `update_metadata_from_json` | Apply a metadata JSON payload using best-effort field mapping |
 | `bulk_update_metadata` | Apply the same edits to many items at once: a list of `ratingKeys`, or every child of `parentRatingKey` (an album's tracks, an artist's albums, a season's episodes). Sets fields such as track artist, year, release date, label and disc number, and adds or removes genres, styles, moods, collections and labels. Items must share one type and library; at most 500 per call. `dryRun=true` previews the items and their current values. Each item is re-read afterwards and any edit Plex didn't save is listed in `failed` |
 | `merge_items` | Merge duplicate movies, shows, artists or albums into one target, like Merge in Plex Web. Previews unless `confirm=true`; Split in Plex Web undoes it |
+| `scan_library` | Scan a library for new, changed and missing files, like Scan Library Files in Plex Web. `path` scans one folder inside the library; `force=true` refreshes all metadata instead. Runs in the background |
+| `empty_trash` | Empty a library's trash, removing items whose files are missing along with their watch history. Plex can't undo it, and items on an offline drive count as missing. Previews unless `confirm=true` |
 | `create_playlist` | Create a new smart or static playlist |
 | `add_to_playlist` | Add one item (`ratingKey`) or many (`ratingKeys`) to a playlist in a single request |
 | `remove_from_playlist` | Remove an item from a playlist |

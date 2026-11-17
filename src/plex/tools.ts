@@ -1229,6 +1229,121 @@ export class PlexTools {
     });
   }
 
+  /**
+   * Start a library scan, like "Scan Library Files" in Plex Web: Plex looks for new,
+   * changed and missing files. `path` limits the scan to one folder inside the library.
+   * `force` is "Refresh All Metadata" instead, which re-fetches metadata for every item
+   * (locked fields are kept). Plex runs either in the background and returns at once.
+   */
+  async scanLibrary(libraryId: string, options: { path?: string; force?: boolean } = {}): Promise<MCPResponse> {
+    this.requireMutativeOpsEnabled("scan_library");
+    const library = await this.getLibrarySection(libraryId);
+    const force = options.force === true;
+    const scanPath = options.path === undefined ? undefined : this.requireLibraryPath(library, options.path);
+    if (force && scanPath !== undefined) {
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        "force refreshes metadata for the whole library and can't be limited to a path; pass one or the other"
+      );
+    }
+
+    const params: Record<string, string | number> = {};
+    if (scanPath !== undefined) params.path = scanPath;
+    if (force) params.force = 1;
+    await this.client.makeRequest(`/library/sections/${library.key}/refresh`, params);
+
+    return jsonResponse({
+      started: true,
+      library: { key: library.key, title: library.title, type: library.type },
+      scope: force ? "refresh all metadata" : scanPath !== undefined ? "folder" : "whole library",
+      path: scanPath,
+      alreadyScanning: library.refreshing === true || library.refreshing === 1 || library.refreshing === "1" || undefined,
+      message:
+        "Plex scans in the background. get_libraries shows the library's scannedAt time, " +
+        "and get_recently_added shows what the scan found.",
+    });
+  }
+
+  /**
+   * Empty a library's trash, like "Empty Trash" in Plex Web: items whose files Plex can
+   * no longer find are removed for good, with their watch history and ratings. Plex
+   * can't undo this. Previews unless confirm is true.
+   */
+  async emptyTrash(libraryId: string, confirm: boolean = false): Promise<MCPResponse> {
+    this.requireMutativeOpsEnabled("empty_trash");
+    const library = await this.getLibrarySection(libraryId);
+    const summary = { key: library.key, title: library.title, type: library.type };
+
+    if (!confirm) {
+      return jsonResponse({
+        preview: true,
+        confirmationRequired: true,
+        library: summary,
+        locations: library.locations,
+        message:
+          "Set confirm=true to empty this library's trash. Items whose files are missing are removed for good, " +
+          "with their watch history and ratings, and Plex can't undo it. If a drive or network share holding " +
+          "this library is offline, its items look missing too and would be removed: check the locations " +
+          "above are reachable first.",
+      });
+    }
+
+    await this.client.makeRequest(`/library/sections/${library.key}/emptyTrash`, {}, "PUT");
+    return jsonResponse({ emptied: true, library: summary });
+  }
+
+  /** One library section by key, with its folders; an unknown key is an invalid request. */
+  private async getLibrarySection(
+    libraryId: string
+  ): Promise<{ key: string; title: unknown; type: unknown; refreshing: unknown; locations: string[] }> {
+    validatePlexId(libraryId, "libraryId");
+    const data = validatePlexMediaContainer(await this.client.makeRequest("/library/sections"));
+    const sections =
+      ((data.MediaContainer as Record<string, unknown> | undefined)?.Directory as Record<string, unknown>[]) || [];
+    const section = sections.find((s) => String(s.key) === String(libraryId));
+    if (!section) {
+      throw new McpError(ErrorCode.InvalidRequest, `No library with key ${libraryId}; get_libraries lists them`);
+    }
+    return {
+      key: String(section.key),
+      title: section.title,
+      type: section.type,
+      refreshing: section.refreshing,
+      locations: ((section.Location as Array<{ path?: unknown }> | undefined) ?? [])
+        .map((loc) => loc.path)
+        .filter((p): p is string => typeof p === "string" && p.length > 0),
+    };
+  }
+
+  /**
+   * A scan path must sit inside one of the library's own folders, so a scan can't be
+   * pointed at an arbitrary place on the server. Returned without a trailing separator.
+   */
+  private requireLibraryPath(library: { title: unknown; locations: string[] }, value: unknown): string {
+    if (typeof value !== "string" || value.trim() === "") {
+      throw new McpError(ErrorCode.InvalidRequest, "path must be a folder path inside the library");
+    }
+    if (/[\u0000-\u001f]/.test(value)) {
+      throw new McpError(ErrorCode.InvalidRequest, "path contains control characters");
+    }
+    const trimEnd = (p: string) => (p.length > 1 ? p.replace(/[\\/]+$/, "") : p);
+    const scanPath = trimEnd(value.trim());
+    if (scanPath.split(/[\\/]/).includes("..")) {
+      throw new McpError(ErrorCode.InvalidRequest, "path can't contain '..'");
+    }
+    const inside = library.locations.some((location) => {
+      const root = trimEnd(location);
+      return scanPath === root || scanPath.startsWith(`${root}/`) || scanPath.startsWith(`${root}\\`);
+    });
+    if (!inside) {
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `path must be inside one of ${String(library.title)}'s folders: ${library.locations.join(", ") || "(none listed)"}`
+      );
+    }
+    return scanPath;
+  }
+
   async createPlaylist(
     title: string,
     type: string,
